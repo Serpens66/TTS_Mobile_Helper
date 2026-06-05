@@ -13,7 +13,7 @@ https://api.tabletopsimulator.com/intro/
 and https://github.com/LucasOe/tts-external-api/tree/master (converted by Codex to python)  
   
 # Usage
-- Subscribe to the lua helper script on the steam workshop:  
+- Subscribe to the lua helper script on the steam workshop:  https://steamcommunity.com/sharedfiles/filedetails/?id=3739147243  
 - Download the release from github for the compiled version or the loose files from github if you have a python installation:  
 - Load the workshop content ingame "additive" to your TTS game.  
 - Make sure your mobile phone(s) are in the same network like your PC/Laptop. Does not require internet, can also be a Wifi Hotspot without internet acces.
