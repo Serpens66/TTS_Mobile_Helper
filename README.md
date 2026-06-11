@@ -31,3 +31,12 @@ and https://github.com/LucasOe/tts-external-api/tree/master (converted by Codex 
 - All buttons in TTS are displayed on mobile to be pressed for all players (only one if there are multiple ones with the same name and same description).
 - To limit the display of a button to specific player(s) add a tag like this to the object which contains the button(s): "TTSmobile_For_Orange".
 - To not display the buttons of an object on mobile phones (eg. some helper buttons which are not supposed to be pressed) add to the object the tag: "TTSmobileHideButtons".
+
+<img width="1280" height="591" alt="TTSmobile_2" src="https://github.com/user-attachments/assets/2e1967bf-facb-4d0f-a45f-6dc759577cd6" />
+<img width="591" height="1280" alt="TTSmobile_3" src="https://github.com/user-attachments/assets/ad91eddf-7913-4134-a574-ba7bca054fb8" />
+<img width="591" height="1280" alt="TTSmobile_4" src="https://github.com/user-attachments/assets/75fd151e-a9b6-476d-823b-93ff54abefc2" />
+<img width="591" height="1280" alt="TTSmobile_5" src="https://github.com/user-attachments/assets/a2d51796-da9e-4a5d-9bf0-ac5871751e5a" />
+<img width="591" height="1280" alt="TTSmobile_6" src="https://github.com/user-attachments/assets/1b1b381e-0450-4786-8882-14f56908c180" />
+<img width="591" height="1280" alt="TTSmobile_7" src="https://github.com/user-attachments/assets/0d628969-035a-44cf-a9c1-628d0778a008" />
+<img width="591" height="1280" alt="TTSmobile_8" src="https://github.com/user-attachments/assets/30930f2d-241b-4aea-bc18-c74d7c7d61b3" />
+
