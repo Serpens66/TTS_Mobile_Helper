@@ -1,51 +1,63 @@
-# Tabletop Simulator (Steam) Mobile Helper  
-Show hand cards from game Tabletop Simulator on your mobile phone and interact with them, other players and buttons.  
-  
-- Use this to play the TTS game on one big screen (in my case touch) locally with players sitting around it in real life. The players can use their mobile phone to see and interact with their hand cards, this way other players can not see the handcards.
-- Works by creating a local network from the hardware (eg. PC/Laptop) that runs TTS and connects the mobile phones to it (for better safety dont use it in public network).  
-- Works without internet connection (the PC/Laptop should have internet once to download workhop files).  
-- The TTSMobileHelper.exe was compiled using PyInstaller, so you can run it without installing python yourself. But you can also instead run the server_mobile_actions.py script with your local python installation, in this case install all dependencies manually with pip.  
-  
-  
-I wrote this with help of ChatGPT-Codex, the official documentations:  
-https://api.tabletopsimulator.com/externaleditorapi/  
-https://api.tabletopsimulator.com/intro/  
-and https://github.com/LucasOe/tts-external-api/tree/master (converted by Codex to python)  
-  
-# Usage
-- Subscribe to the lua helper script on the steam workshop:  https://steamcommunity.com/sharedfiles/filedetails/?id=3739147243  
-- Download the release from github for the compiled version or the loose files from github if you have a python installation: https://github.com/Serpens66/TTS_Mobile_Helper/releases    
-- Load the workshop content ingame "additive" to your TTS game (or save the content from "helper_object_mobile_actions.lua" to the script of an object within TTS).  
-- Make sure your mobile phone(s) are in the same network like your PC/Laptop. Does not require internet, can also be a Wifi Hotspot without internet acces.
-- Start the TTSMobileHelper.exe (or the server_mobile_actions.py script. For debugging start it with "python server_mobile_actions.py --debug-tts-api" and set "local Debug = true" in the lua script of the helper object within TTS)  
-- Scan the QR code shown in the python console with your mobile phone (admin or player. admins are able to control each player, while players are only able to control one colour)
-- Your mobile phones should now show the Interface and you should be connected.
+# Tabletop Simulator Mobile Helper
 
-## Build on Windows
+Play Tabletop Simulator in local Hotseat mode on a shared screen. Keep the table visible from the spectator view while players use their phones to see and control their own hands.
 
-Install the Python dependencies and run the build from the repository directory.
+## Features
+
+- **Live hand updates and card actions.** View, sort, flip, play, and give cards from a phone. Request a random face-down card or choose from another player's open hand after they approve the request.
+- **Player and admin views.** Use separate QR codes for players and for the host. A player controls one color and the admin can switch between colors.
+- **Drop targets and game buttons.** Add tagged snap points as destinations for played cards and use existing TTS object buttons from the phone.
+- **Twelve interface languages.** The page uses the browser's preferred language when a translation is available.
+- **Local network play.** The helper serves the interface and its Socket.IO client locally, and can reuse images already cached by TTS on the host PC.
+
+## Quick start
+
+1. Load your game in Tabletop Simulator. Add the [Workshop helper](https://steamcommunity.com/sharedfiles/filedetails/?id=3739147243) to the existing table using **Additive Load**, or copy [the Lua script](helper_object_mobile_actions.lua) into a TTS object's script and use **Save & Play**.
+2. Download and extract the [Windows release](https://github.com/Serpens66/TTS_Mobile_Helper/releases). Run `TTSMobileHelper.exe` from the extracted folder on the PC running TTS. Keep the accompanying files in that folder.
+3. Connect the phones to the same local network as the PC. A local Wi-Fi hotspot also works. On a trusted network, scan the **Player** QR code on each player's phone and the **Admin** QR code on the host's phone. The player link assigns an available color.
+
+The helper itself runs on the LAN. Download the Workshop content in advance for offline play. Card images that TTS has not cached may still need to load from their original URLs. Anyone on the network who opens the admin link can use the admin view.
+
+### Run from source
+
+Use Python 3.9 or later and run these commands from the project folder.
 
 ```powershell
-python -m pip install Flask Flask-SocketIO python-engineio qrcode PyInstaller
-.\build_pyinstaller.bat
+python -m pip install -r requirements.txt
+python server_mobile_actions.py
 ```
 
-The executable and its companion files are written to `dist/TTSMobileHelper/`. Distribute the whole folder when packaging a Windows release. To use a portable Python installation, install the same dependencies with that interpreter and pass its executable to the build script.
+## Troubleshooting
 
-```powershell
-.\build_pyinstaller.bat -Python "C:/path/to/python.exe"
-```
+| If you see | Try |
+| --- | --- |
+| The phone cannot open the QR link | Check that the phone and PC are on the same network. Open `http://<PC-IP>:5001/` from the phone. If the QR code shows the wrong address, start the current source with `python server_mobile_actions.py --lan-ip 192.168.1.100`, using the PC's IPv4 address on that network. The option also works in Windows builds made from this source. |
+| The page opens but waits for TTS | Check that the Lua helper is loaded on the active table and the server is running on the TTS PC. |
+| You need logs to diagnose TTS communication | Start with `--debug-tts-api` for both directions, or use `--debug-tts-incoming` or `--debug-tts-outgoing`. To enable logging in TTS, set `local DEBUG = true` in the helper object's Lua script. |
 
-# Customization in TTS:
-## To define Card Drop zones to be displayed on mobile: 
-- Create "Snap Point" in TTS and rightclick it.
-- Add a Tag to it like "TTSmobile_MyDropZone", this will show this as card drop zone on mobile phones for all players with the name "MyDropZone".
-- Or use a tag like "TTSmobile_MyDropZone_For_Yellow_Red", this will show this as card drop zone on mobile phones for yellow and red player with the name "MyDropZone".
-- Keep in mind that tags on Snap Points will make cards only snap to it, if the cards and the point have at least one tag in common. So basically it disables the snap functionality for them. If you want the snap functionality create another Snap Point without a tag and move it at the very same position.
-## Usage of TTS Buttons:
-- All buttons in TTS are displayed on mobile to be pressed for all players (only one if there are multiple ones with the same name and same description).
-- To limit the display of a button to specific player(s) add a tag like this to the object which contains the button(s): "TTSmobile_For_Orange".
-- To not display the buttons of an object on mobile phones (eg. some helper buttons which are not supposed to be pressed) add to the object the tag: "TTSmobileHideButtons".
+## Customization in TTS
+
+### Card drop zones
+
+Create or edit a snap point and add one of these tags.
+
+| Tag | Result |
+| --- | --- |
+| `TTSmobile_MyDropZone` | Displays **MyDropZone** for all player colors. |
+| `TTSmobile_MyDropZone_For_Yellow_Red` | Displays **MyDropZone** for Yellow and Red. |
+
+In TTS, a tagged snap point only snaps cards that share a tag with it. To retain snapping for untagged cards, add a second, untagged snap point at the same position.
+
+### Usage of TTS buttons
+
+TTS object buttons can be triggered from phones. Buttons with the same name, tooltip, and color visibility are listed once. To control visibility, add tags to the object that owns the buttons.
+
+| Tag | Result |
+| --- | --- |
+| `TTSmobile_For_Orange` | Shows the object's buttons for Orange. |
+| `TTSmobileHideButtons` | Hides the object's buttons on phones. |
+
+### Screenshots
 
 <img width="1280" height="591" alt="TTSmobile_2" src="https://github.com/user-attachments/assets/2e1967bf-facb-4d0f-a45f-6dc759577cd6" />
 <img width="591" height="1280" alt="TTSmobile_3" src="https://github.com/user-attachments/assets/ad91eddf-7913-4134-a574-ba7bca054fb8" />
@@ -55,3 +67,34 @@ The executable and its companion files are written to `dist/TTSMobileHelper/`. D
 <img width="591" height="1280" alt="TTSmobile_7" src="https://github.com/user-attachments/assets/0d628969-035a-44cf-a9c1-628d0778a008" />
 <img width="591" height="1280" alt="TTSmobile_8" src="https://github.com/user-attachments/assets/30930f2d-241b-4aea-bc18-c74d7c7d61b3" />
 
+## Languages
+
+The mobile interface ships with English, German, Spanish, French, Italian, Portuguese, Dutch, Polish, Russian, Simplified Chinese, Japanese, and Korean. Translation files are in [localization/](localization/). The page uses the server PC's language if the browser does not request a supported language, and English is the fallback for missing strings. Card names and descriptions come from the game.
+
+## How it works
+
+| Part | Role |
+| --- | --- |
+| [Lua helper](helper_object_mobile_actions.lua) | Runs inside TTS and sends hand, drop target, and button updates over HTTP to the server on the same PC. |
+| [Python server](server_mobile_actions.py) | Serves the phone interface on port 5001 and sends updates to browsers via Socket.IO. |
+| [Mobile interface](mobile_ui.html), [CSS](static/mobile_ui.css), and [JavaScript](static/mobile_ui.js) | Display cards and controls and send player actions back to the server. |
+| [TTS adapter](tts_api_chatgpt.py) | Sends actions back to TTS through the External Editor API. |
+
+## Build on Windows
+
+Run from the project directory.
+
+```powershell
+python -m pip install -r requirements.txt PyInstaller
+.\build_pyinstaller.bat
+```
+
+The executable and its companion files are written to `dist/TTSMobileHelper/`. Distribute the whole folder when packaging a Windows release. To build with a portable Python installation, install the same dependencies with that interpreter and pass its executable path.
+
+```powershell
+.\build_pyinstaller.bat -Python "C:/path/to/python.exe"
+```
+
+## Credits
+
+Built with help from ChatGPT Codex, the [Tabletop Simulator scripting documentation](https://api.tabletopsimulator.com/intro/), and the [External Editor API documentation](https://api.tabletopsimulator.com/externaleditorapi/). The Python adapter draws on [LucasOe's TTS External API wrapper](https://github.com/LucasOe/tts-external-api).

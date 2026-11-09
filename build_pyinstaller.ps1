@@ -11,7 +11,9 @@ try {
         "TTSMobileHelper.spec",
         "socket.io.js",
         "mobile_ui.html",
-        "localization"
+        "localization",
+        "static/mobile_ui.css",
+        "static/mobile_ui.js"
     )
 
     foreach ($relativePath in $requiredPaths) {

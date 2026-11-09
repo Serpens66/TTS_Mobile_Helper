@@ -5,7 +5,12 @@ a = Analysis(
     ['server_mobile_actions.py'],
     pathex=[],
     binaries=[],
-    datas=[('socket.io.js', '.'), ('localization', 'localization'), ('mobile_ui.html', '.')],
+    datas=[
+        ('socket.io.js', '.'),
+        ('localization', 'localization'),
+        ('mobile_ui.html', '.'),
+        ('static', 'static'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

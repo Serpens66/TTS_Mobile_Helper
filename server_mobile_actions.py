@@ -5,6 +5,7 @@ import qrcode
 import sys
 import locale
 import argparse
+from ipaddress import IPv4Address
 from os import environ
 from pathlib import Path
 from flask import Flask, render_template_string, request, send_from_directory, redirect
@@ -46,11 +47,28 @@ def add_security_headers(response):
 tts_api_chatgpt = None
 TTS_API_DEBUG_INCOMING = False
 TTS_API_DEBUG_OUTGOING = False
+LAN_IP_OVERRIDE = None
+
+
+def parse_lan_ip(value):
+    try:
+        address = IPv4Address(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a valid IPv4 address") from exc
+    if address.is_loopback or address.is_unspecified or address.is_multicast or address.is_reserved:
+        raise argparse.ArgumentTypeError("expected the IPv4 address of a LAN interface")
+    return str(address)
 
 
 def parse_start_arguments(argv=None):
     parser = argparse.ArgumentParser(
         description="TTS Mobile Companion Server"
+    )
+    parser.add_argument(
+        "--lan-ip",
+        type=parse_lan_ip,
+        metavar="IPv4",
+        help="Use this LAN address in phone links instead of auto-detecting it.",
     )
     parser.add_argument(
         "--debug-tts-api",
@@ -71,7 +89,8 @@ def parse_start_arguments(argv=None):
 
 
 def apply_start_arguments(args):
-    global TTS_API_DEBUG_INCOMING, TTS_API_DEBUG_OUTGOING
+    global TTS_API_DEBUG_INCOMING, TTS_API_DEBUG_OUTGOING, LAN_IP_OVERRIDE
+    LAN_IP_OVERRIDE = args.lan_ip
     TTS_API_DEBUG_INCOMING = bool(args.debug_tts_api or args.debug_tts_incoming)
     TTS_API_DEBUG_OUTGOING = bool(args.debug_tts_api or args.debug_tts_outgoing)
 
@@ -471,15 +490,15 @@ def emit_hand_state_to_all_colors():
 
 # 1. Lokale IP-Adresse ermitteln, damit die Handys den PC finden
 def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
-    finally:
-        s.close()
-    return IP
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('10.255.255.255', 1))
+            return probe.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return '127.0.0.1'
 
 LOCAL_IP = None
 PORT = 5001  # Port fuer das Handy-Webinterface
@@ -487,6 +506,8 @@ PORT = 5001  # Port fuer das Handy-Webinterface
 
 def get_server_ip():
     global LOCAL_IP
+    if LAN_IP_OVERRIDE is not None:
+        return LAN_IP_OVERRIDE
     if LOCAL_IP is None:
         LOCAL_IP = get_local_ip()
     return LOCAL_IP
@@ -496,6 +517,9 @@ def print_start_qr_codes():
     local_ip = get_server_ip()
     print("\n" + "="*50)
     print(f"SERVER GESTARTET! Lokale IP: {local_ip}")
+    if IPv4Address(local_ip).is_loopback:
+        print("[WARNUNG] Diese Adresse ist nur auf diesem PC erreichbar.")
+        print("          Gib die IPv4-Adresse im selben Netz wie das Handy mit --lan-ip an.")
     print("Scanne den passenden QR-Code mit dem Handy:")
     for label, url in [
         ("Admin", f"http://{local_ip}:{PORT}/?admin=1"),
@@ -1353,7 +1377,6 @@ def render_error_page(message, language=None):
 @app.route('/')
 def index():
     language = request_language()
-    i18n_json = json.dumps(client_i18n(language), ensure_ascii=False)
     if request.args.get("join") == "player":
         return render_template_string("""
         <!DOCTYPE html>
@@ -1390,7 +1413,7 @@ def index():
         mobile_ui_template,
         language=language,
         title=translate("app.title", language),
-        i18n_json=i18n_json,
+        i18n=client_i18n(language),
         tr=lambda key, params=None: translate(key, language, params),
     )
 
