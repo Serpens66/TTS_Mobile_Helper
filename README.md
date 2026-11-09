@@ -16,6 +16,8 @@ Play Tabletop Simulator in local Hotseat mode on a shared screen. Keep the table
 2. Download and extract the [Windows release](https://github.com/Serpens66/TTS_Mobile_Helper/releases). Run `TTSMobileHelper.exe` from the extracted folder on the PC running TTS. Keep the accompanying files in that folder.
 3. Connect the phones to the same local network as the PC. A local Wi-Fi hotspot also works. On a trusted network, scan the **Player** QR code on each player's phone and the **Admin** QR code on the host's phone. The player link assigns an available color.
 
+When running the current source or a build made from it, load the matching Lua script from this checkout into the helper object. The bundled Python server and the Lua helper exchange a versioned table snapshot before enabling actions.
+
 The helper itself runs on the LAN. Download the Workshop content in advance for offline play. Card images that TTS has not cached may still need to load from their original URLs. Anyone on the network who opens the admin link can use the admin view.
 
 ### Run from source
@@ -94,6 +96,10 @@ The executable and its companion files are written to `dist/TTSMobileHelper/`. D
 ```powershell
 .\build_pyinstaller.bat -Python "C:/path/to/python.exe"
 ```
+
+## Tests
+
+Run `python -m unittest discover -s tests -v` after installing the Python dependencies. For changes to the Lua helper, also test the matching Lua and Python versions on a separate TTS table.
 
 ## Credits
 

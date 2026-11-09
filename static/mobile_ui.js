@@ -44,6 +44,10 @@ const CARD_LAYOUT_RESERVE_PX = 8;
 const MIN_RESPONSIVE_CARD_IMAGE_HEIGHT = 40;
 
 let currentCards = [];
+let serverCards = [];
+let reorderPending = false;
+let confirmedColor = null;
+let pendingColor = null;
 let playerColors = [];
 let handZoneColors = [];
 let seatedColors = [];
@@ -54,10 +58,11 @@ let dropZones = [];
 let mobileButtons = [];
 let pythonSocketConnected = false;
 let luaConnected = false;
-let luaLastContactAt = null;
+let tableReady = false;
 let incomingInteractions = [];
 let outgoingInteractions = [];
 let activeOpenPick = null;
+let openPickPending = false;
 let openPickSelectedGuids = new Set();
 let giveTargetColor = "";
 let interactionTargetColor = "";
@@ -181,16 +186,66 @@ socket.on('connect', () => {
 
 socket.on('disconnect', () => {
     pythonSocketConnected = false;
+    confirmedColor = null;
+    pendingColor = null;
+    setTableStatus({ connected: false, ready: false });
+});
+
+function setTableStatus(status) {
+    luaConnected = status.connected === true;
+    tableReady = status.ready === true;
+    if (!tableReady) {
+        onPointerCancel();
+        clearOpenPick();
+        reorderPending = false;
+    }
     updateConnectionState();
+}
+
+socket.on('lua_status', setTableStatus);
+
+socket.on('join_success', ({color}) => {
+    const previous = confirmedColor;
+    confirmedColor = color;
+    pendingColor = null;
+    myColor = color;
+    if (previous !== color) {
+        onPointerCancel();
+        selectedGuids.clear();
+        clearOpenPick();
+        closeCardZoom();
+        closeAllMenus();
+        serverCards = [];
+        currentCards = [];
+        reorderPending = false;
+        renderCards();
+    }
+    if (isAdmin) {
+        localStorage.setItem(ADMIN_COLOR_STORAGE_KEY, color);
+    } else {
+        const url = new URL(window.location.href);
+        url.searchParams.set('color', color);
+        history.replaceState(null, '', url);
+    }
+    updateControlledColorChrome();
 });
 
 socket.on('hand_updated', (data) => {
-    if (data.color) {
-        myColor = data.color;
-        if (isAdmin) localStorage.setItem(ADMIN_COLOR_STORAGE_KEY, myColor);
-        updateControlledColorChrome();
+    if (data.color !== confirmedColor) return;
+    const nextCards = Array.isArray(data.cards) ? data.cards : [];
+    const authoritativeChange = JSON.stringify(nextCards) !== JSON.stringify(serverCards);
+    serverCards = nextCards;
+    if (authoritativeChange || (!reorderPending && JSON.stringify(currentCards) !== JSON.stringify(nextCards))) {
+        onPointerCancel();
+        currentCards = nextCards;
+        const handGuids = new Set(currentCards.map(card => card.guid));
+        selectedGuids = new Set([...selectedGuids].filter(guid => handGuids.has(guid)));
+        if (cardZoomGuid) {
+            if (handGuids.has(cardZoomGuid)) renderCardZoom();
+            else closeCardZoom();
+        }
+        renderCards();
     }
-    currentCards = Array.isArray(data.cards) ? data.cards : [];
     playerColors = Array.isArray(data.players) ? data.players : playerColors;
     if (Array.isArray(data.hand_zone_colors)) {
         handZoneColors = data.hand_zone_colors;
@@ -201,29 +256,34 @@ socket.on('hand_updated', (data) => {
         seatedColorsReceived = true;
     }
     occupiedColors = Array.isArray(data.occupied_colors) ? data.occupied_colors : occupiedColors;
-    if (data.lua_connection && typeof data.lua_connection === 'object') {
-        luaConnected = data.lua_connection.connected === true;
-        luaLastContactAt = data.lua_connection.last_contact_at || null;
-    }
     dropZones = Array.isArray(data.drop_zones) ? data.drop_zones : dropZones;
     mobileButtons = Array.isArray(data.mobile_buttons) ? data.mobile_buttons : mobileButtons;
-    selectedGuids = new Set([...selectedGuids].filter(guid => currentCards.some(card => card.guid === guid)));
-    renderCards();
     renderPlayerTargets();
     renderZoneTargets();
     renderMobileButtons();
     renderFavoriteButtons();
     updateHeaderCounts();
     buildColorDropdown();
-    updateConnectionState();
+    if (data.lua_connection) setTableStatus(data.lua_connection);
 });
 
 socket.on('join_error', (data) => {
-    setConnectionState('disconnected');
-    showFatalMessage(localizedMessage(data, 'error', 'errors.color_unavailable'));
+    pendingColor = null;
+    const message = localizedMessage(data, 'error', 'errors.color_unavailable');
+    if (confirmedColor) {
+        alert(message);
+    } else {
+        setConnectionState('disconnected');
+        showFatalMessage(message);
+    }
 });
 
 socket.on('card_action_result', (data) => {
+    if (data.color && data.color !== confirmedColor) return;
+    if (data.action === 'reorder_hand') {
+        reorderPending = false;
+        if (!data.ok) restoreServerCards();
+    }
     if (!data.ok) alert(localizedMessage(data, 'error', 'errors.action_failed'));
 });
 
@@ -248,16 +308,19 @@ socket.on('interaction_open_pick', (data) => {
         cards: Array.isArray(data.cards) ? data.cards : [],
     };
     openPickSelectedGuids = new Set();
+    openPickPending = false;
     renderOpenPick();
+    updateOpenPickSelectionState();
     openOpenPickMenu();
 });
 
 socket.on('interaction_result', (data) => {
     const requestData = data.request || null;
-    if (!data.ok && activeOpenPick?.request?.id && requestData?.id === activeOpenPick.request.id) {
-        activeOpenPick = null;
-        openPickSelectedGuids = new Set();
-        closeOpenPickMenu();
+    if (activeOpenPick && requestData?.id === activeOpenPick.request.id) {
+        clearOpenPick();
+    } else if (openPickPending && !requestData && !data.ok) {
+        openPickPending = false;
+        updateOpenPickSelectionState();
     }
     const shouldAlert =
         !data.ok &&
@@ -349,7 +412,7 @@ function createCardElement(card) {
     const imageElement = createCardImage(card);
     const title = document.createElement('div');
     title.className = 'card-title';
-    let displayName = card.name ? (card.face_down ? '?' : card.name) : '';
+    let displayName = card.name ? (card.face_down === true ? '?' : card.name) : '';
     title.textContent = displayName;
     if (!displayName) title.style.display = 'none';
 
@@ -597,7 +660,7 @@ function onPointerDown(event, guid) {
 }
 
 function onPointerMove(event) {
-    if (!pressStart || !draggingGuid) return;
+    if (!pressStart || !draggingGuid || !tableReady || reorderPending) return;
     const dx = event.clientX - pressStart.x;
     const dy = event.clientY - pressStart.y;
     const distance = Math.hypot(dx, dy);
@@ -629,6 +692,7 @@ function onPointerUp(event) {
 
 function onPointerCancel() {
     clearTimeout(pressTimer);
+    pressTimer = null;
     pressStart = null;
     draggingGuid = null;
     dragStarted = false;
@@ -789,7 +853,7 @@ function finishDragGroup() {
         cleanupDropClasses();
         selectedGuids.clear();
         renderCards();
-        sendCardAction('reorder_hand', currentCards.map(card => card.guid));
+        submitHandOrder();
         dragGuids = [];
         updateHandScrollbar();
         return;
@@ -817,9 +881,20 @@ function finishDragGroup() {
     cleanupDropClasses();
     selectedGuids.clear();
     renderCards();
-    sendCardAction('reorder_hand', currentCards.map(card => card.guid));
+    submitHandOrder();
     dragGuids = [];
     updateHandScrollbar();
+}
+
+function restoreServerCards() {
+    onPointerCancel();
+    currentCards = serverCards;
+    renderCards();
+}
+
+function submitHandOrder() {
+    reorderPending = sendCardAction('reorder_hand', currentCards.map(card => card.guid));
+    if (!reorderPending) restoreServerCards();
 }
 
 function swapSingleDraggedCardWithTarget(targetGuid) {
@@ -897,6 +972,7 @@ function setConnectionState(state) {
     const labels = {
         connected: t('status.connected'),
         'lua-disconnected': t('status.lua_disconnected'),
+        syncing: t('status.syncing'),
         connecting: t('status.connecting'),
         disconnected: t('status.disconnected'),
     };
@@ -908,7 +984,7 @@ function updateConnectionState() {
         setConnectionState('disconnected');
         return;
     }
-    setConnectionState(luaConnected ? 'connected' : 'lua-disconnected');
+    setConnectionState(tableReady ? 'connected' : (luaConnected ? 'syncing' : 'lua-disconnected'));
 }
 
 function connectionInfoText() {
@@ -918,7 +994,7 @@ function connectionInfoText() {
     if (!luaConnected) {
         return t('status.info_lua_disconnected');
     }
-    return t('status.info_connected');
+    return t(tableReady ? 'status.info_connected' : 'status.syncing');
 }
 
 function showConnectionInfo() {
@@ -927,7 +1003,7 @@ function showConnectionInfo() {
 
 function requestAdminSyncAllHands() {
     if (!isAdmin) return;
-    socket.emit('admin_sync_all_hands', {
+    emitGameAction('admin_sync_all_hands', {
         color: myColor,
         language: navigator.language || '',
         languages: navigator.languages || [],
@@ -935,7 +1011,8 @@ function requestAdminSyncAllHands() {
 }
 
 function joinControlledColor(color) {
-    if (!color) return;
+    if (!color || !socket.connected || pendingColor) return;
+    pendingColor = color;
     socket.emit('join', {
         color,
         client_id: clientId,
@@ -1045,26 +1122,13 @@ function closeColorDropdown() {
 }
 
 function switchPlayerColor(color) {
-    if (!color || color === myColor) {
-        closeColorDropdown();
-        return;
-    }
-    if (isAdmin) {
-        myColor = color;
-        localStorage.setItem(ADMIN_COLOR_STORAGE_KEY, myColor);
-        updateControlledColorChrome();
-        joinControlledColor(myColor);
-        closeColorDropdown();
-        return;
-    }
-    if (occupiedColors.includes(color)) {
+    closeColorDropdown();
+    if (!color || color === myColor || pendingColor) return;
+    if (!isAdmin && occupiedColors.includes(color)) {
         alert(t('errors.color_occupied'));
-        closeColorDropdown();
         return;
     }
-    const nextUrl = new URL(window.location.href);
-    nextUrl.searchParams.set('color', color);
-    window.location.href = nextUrl.toString();
+    joinControlledColor(color);
 }
 
 function formatLongPressSeconds() {
@@ -2221,7 +2285,7 @@ function executeFavorite(slot) {
         return;
     }
     if (favorite.type === 'interaction_request') {
-        socket.emit('interaction_request', {
+        emitGameAction('interaction_request', {
             color: myColor,
             target_color: favorite.target_color,
             interaction_type: favorite.interaction_type,
@@ -2462,7 +2526,7 @@ function submitInteractionRequest() {
         finishFavoriteAssignment(closeInteractionMenu);
         return;
     }
-    socket.emit('interaction_request', {
+    emitGameAction('interaction_request', {
         color: myColor,
         target_color: target,
         interaction_type: interactionType,
@@ -2471,7 +2535,7 @@ function submitInteractionRequest() {
 }
 
 function respondInteraction(requestId, accepted) {
-    socket.emit('interaction_response', {
+    emitGameAction('interaction_response', {
         color: myColor,
         request_id: requestId,
         accepted,
@@ -2479,14 +2543,14 @@ function respondInteraction(requestId, accepted) {
 }
 
 function cancelInteraction(requestId) {
-    socket.emit('interaction_cancel', {
+    emitGameAction('interaction_cancel', {
         color: myColor,
         request_id: requestId,
     });
 }
 
 function openSelectionRequest(requestId) {
-    socket.emit('interaction_open_selection_request', {
+    emitGameAction('interaction_open_selection_request', {
         color: myColor,
         request_id: requestId,
     });
@@ -2543,7 +2607,7 @@ function renderOpenPick() {
 }
 
 function toggleOpenPickCard(guid) {
-    if (!activeOpenPick || !guid) return;
+    if (!activeOpenPick || !guid || openPickPending) return;
     const maxCount = Number(activeOpenPick.request?.count || 0);
     if (openPickSelectedGuids.has(guid)) {
         openPickSelectedGuids.delete(guid);
@@ -2560,46 +2624,59 @@ function updateOpenPickSelectionState() {
     if (countLabel) {
         countLabel.textContent = `${openPickSelectedGuids.size}/${requestData.count || 0}`;
     }
+    document.getElementById('open-pick-confirm').disabled = openPickPending;
+    document.getElementById('open-pick-cancel').disabled = openPickPending;
     document.querySelectorAll('#open-pick-list .card').forEach(card => {
         card.classList.toggle('selected', openPickSelectedGuids.has(card.dataset.guid));
     });
 }
 
 function confirmOpenPick() {
-    if (!activeOpenPick) return;
+    if (!activeOpenPick || openPickPending) return;
     const requestData = activeOpenPick.request || {};
     const guids = [...openPickSelectedGuids];
     if (guids.length !== Number(requestData.count || 0)) {
         alert(t('errors.pick_exact_count'));
         return;
     }
-    socket.emit('interaction_pick_cards', {
+    openPickPending = emitGameAction('interaction_pick_cards', {
         color: myColor,
         request_id: requestData.id,
         guids,
     });
+    updateOpenPickSelectionState();
+}
+
+function clearOpenPick() {
     activeOpenPick = null;
+    openPickPending = false;
     openPickSelectedGuids = new Set();
     closeOpenPickMenu();
 }
 
 function cancelOpenPick() {
-    if (activeOpenPick?.request?.id) {
-        cancelInteraction(activeOpenPick.request.id);
+    if (openPickPending) return;
+    if (activeOpenPick?.request?.id) cancelInteraction(activeOpenPick.request.id);
+    clearOpenPick();
+}
+
+function emitGameAction(event, data) {
+    if (!socket.connected || !tableReady || !confirmedColor || pendingColor) {
+        alert(t('errors.tts_not_ready'));
+        return false;
     }
-    activeOpenPick = null;
-    openPickSelectedGuids = new Set();
-    closeOpenPickMenu();
+    socket.emit(event, data);
+    return true;
 }
 
 function sendCardAction(action, guids, target = null) {
-    if (!guids || guids.length === 0) return;
-    socket.emit('card_action', { color: myColor, action, guids, target });
+    if (!guids?.length) return false;
+    return emitGameAction('card_action', { color: myColor, action, guids, target });
 }
 
 function sendMobileButtonAction(buttonId, altClick = mobileButtonAltClick) {
     if (!buttonId) return;
-    socket.emit('mobile_button_action', { color: myColor, button_id: buttonId, alt_click: !!altClick });
+    emitGameAction('mobile_button_action', { color: myColor, button_id: buttonId, alt_click: !!altClick });
 }
 
 container.addEventListener('scroll', updateHandScrollbar);
@@ -2898,12 +2975,10 @@ function applyTTSCardSize(cardDiv, card, layoutContext = 'hand') {
 }
 
 function createCardImage(card, layoutContext = 'hand') {
-    const showBack = card.face_down && card.back_image;
-
-    if (showBack) {
+    if (card.face_down === true) {
         card = {
             ...card,
-            image: card.back_image,
+            image: card.back_image || '',
             atlas_width: 1,
             atlas_height: 1,
             card_index: null,

@@ -149,6 +149,11 @@
   "settings.sync_all_hands_sent": "Synchronisierung fuer {count} Farbe(n) angefordert.",
   "status.lua_disconnected": "Python verbunden, TTS/Lua wartet",
   "status.info_connected": "Das Handy ist mit Python verbunden und Python hat Daten vom TTS-Lua-Script erhalten.",
-  "status.info_lua_disconnected": "Das Handy ist mit Python verbunden, aber Python hat seit dem Serverstart noch keinen Kontakt vom TTS-Lua-Script erhalten. Lade das Helper-Objekt in TTS oder pruefe die Lua-Serververbindung.",
-  "status.info_disconnected": "Das Handy ist nicht mit dem Python-Server verbunden."
+  "status.info_lua_disconnected": "Das Handy erreicht Python, aber der TTS-Helfer antwortet nicht. Prüfe, ob das Helferobjekt auf dem aktuellen Tisch geladen ist.",
+  "status.info_disconnected": "Das Handy ist nicht mit dem Python-Server verbunden.",
+  "errors.tts_not_ready": "Der TTS-Tisch ist noch nicht bereit. Warte auf die Synchronisierung.",
+  "errors.action_unconfirmed": "TTS hat die Aktion nicht bestätigt. Prüfe die aktuelle Hand, bevor du es erneut versuchst.",
+  "errors.drop_target_changed": "Dieses Ablageziel ist nicht mehr verfügbar. Wähle ein aktuelles Ziel.",
+  "errors.hand_order_changed": "Die Hand hat sich vor dem Sortieren geändert. Die aktuelle Reihenfolge wurde wiederhergestellt.",
+  "status.syncing": "TTS-Tisch wird synchronisiert"
 }

@@ -78,6 +78,7 @@ class AsyncExternalEditorApi:
         timeout: float = 10.0,
         debug_incoming: bool = False,
         debug_outgoing: bool = False,
+        collect_events: bool = True,
     ):
         self.host = host
         self.receive_port = receive_port
@@ -93,6 +94,7 @@ class AsyncExternalEditorApi:
         self._send_lock = asyncio.Lock()
         self._pending_returns: dict[int, asyncio.Future] = {}
         self.events: asyncio.Queue = asyncio.Queue()
+        self.collect_events = collect_events
 
     async def start(self):
         self._server = await asyncio.start_server(
@@ -137,10 +139,14 @@ class AsyncExternalEditorApi:
                 if future and not future.done():
                     future.set_result(answer)
 
-            await self.events.put(answer)
+            if self.collect_events:
+                self.events.put_nowait(answer)
 
         except Exception as e:
-            await self.events.put(e)
+            if self.collect_events:
+                self.events.put_nowait(e)
+            elif self.debug_incoming:
+                print(f"[TTS API] {e}")
 
         finally:
             writer.close()
@@ -150,51 +156,42 @@ class AsyncExternalEditorApi:
                 pass
 
     async def send(self, message: dict) -> None:
-        async with self._send_lock:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.send_port),
-                timeout=self.timeout,
-            )
-            if self.debug_outgoing:
-                print("\n" + "=" * 60)
-                print("[PYTHON -> TTS]")
-                print(json.dumps(message, indent=2, ensure_ascii=False))
-                print("=" * 60)
-            writer.write(json.dumps(message).encode("utf-8"))
-            await writer.drain()
+        await asyncio.wait_for(self._send_message(message), timeout=self.timeout)
 
-            writer.close()
+    async def _send_message(self, message: dict) -> None:
+        async with self._send_lock:
+            _, writer = await asyncio.open_connection(self.host, self.send_port)
+            try:
+                if self.debug_outgoing:
+                    print("\n" + "=" * 60)
+                    print("[PYTHON -> TTS]")
+                    print(json.dumps(message, indent=2, ensure_ascii=False))
+                    print("=" * 60)
+                writer.write(json.dumps(message).encode("utf-8"))
+                await writer.drain()
+            finally:
+                writer.close()
             await writer.wait_closed()
 
     async def execute(self, script: str) -> ReturnAnswer:
-        return_id = next(self._return_ids)
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        self._pending_returns[return_id] = future
-
-        await self.send({
-            "messageID": MESSAGE_EXECUTE,
-            "returnID": return_id,
-            "guid": "-1",
-            "script": script,
-        })
-
-        return await asyncio.wait_for(future, timeout=self.timeout)
+        return await self.execute_on_object(script, "-1")
 
     async def execute_on_object(self, script: str, guid: str) -> ReturnAnswer:
         return_id = next(self._return_ids)
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
+        future = asyncio.get_running_loop().create_future()
         self._pending_returns[return_id] = future
-
-        await self.send({
-            "messageID": MESSAGE_EXECUTE,
-            "returnID": return_id,
-            "guid": guid,
-            "script": script,
-        })
-
-        return await asyncio.wait_for(future, timeout=self.timeout)
+        try:
+            await self.send({
+                "messageID": MESSAGE_EXECUTE,
+                "returnID": return_id,
+                "guid": guid,
+                "script": script,
+            })
+            return await asyncio.wait_for(future, timeout=self.timeout)
+        finally:
+            self._pending_returns.pop(return_id, None)
+            if not future.done():
+                future.cancel()
 
     async def execute_nowait(self, script: str) -> None:
         return_id = next(self._return_ids)
@@ -284,7 +281,13 @@ class ExternalEditorApi:
 
         self._api = AsyncExternalEditorApi(*args, **kwargs)
 
-        self._run(self._api.start())
+        try:
+            self._run(self._api.start())
+        except BaseException:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join()
+            self._loop.close()
+            raise
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)

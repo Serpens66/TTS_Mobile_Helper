@@ -1,17 +1,19 @@
 import socket
 import json
 import time
+import math
+import logging
+import uuid
 import qrcode
 import sys
 import locale
 import argparse
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, ip_address
 from os import environ
 from pathlib import Path
 from flask import Flask, render_template_string, request, send_from_directory, redirect
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import engineio.async_drivers.threading  # needed by PyInstaller for async_mode="threading"
-from urllib.parse import unquote
 import struct
 import threading
 import re
@@ -45,6 +47,7 @@ def add_security_headers(response):
     return response
 
 tts_api_chatgpt = None
+TTS_ADAPTER_LOCK = threading.Lock()
 TTS_API_DEBUG_INCOMING = False
 TTS_API_DEBUG_OUTGOING = False
 LAN_IP_OVERRIDE = None
@@ -97,14 +100,14 @@ def apply_start_arguments(args):
 
 def get_tts_api_chatgpt():
     global tts_api_chatgpt
-    if tts_api_chatgpt is None:
-        # Instanz der uebersetzten Rust-Klasse erstellen:
-        # https://github.com/LucasOe/tts-external-api/tree/master
-        tts_api_chatgpt = ExternalEditorApi_chatgpt(
-            debug_incoming=TTS_API_DEBUG_INCOMING,
-            debug_outgoing=TTS_API_DEBUG_OUTGOING,
-        )
-    return tts_api_chatgpt
+    with TTS_ADAPTER_LOCK:
+        if tts_api_chatgpt is None:
+            tts_api_chatgpt = ExternalEditorApi_chatgpt(
+                debug_incoming=TTS_API_DEBUG_INCOMING,
+                debug_outgoing=TTS_API_DEBUG_OUTGOING,
+                collect_events=False,
+            )
+        return tts_api_chatgpt
 
 # Speicher fuer die aktuellen Handkarten der Spieler
 # Struktur: {"Red": [{"guid": "123456", "name": "Holz", "image": "url"}], "Blue": ...}
@@ -300,7 +303,17 @@ drop_zones = []
 mobile_buttons = []
 hand_zone_colors = []
 seated_colors = []
+STATE_LOCK = threading.RLock()
+LUA_TIMEOUT_SECONDS = 10
+ACTION_TIMEOUT_SECONDS = 10
 last_lua_contact_at = None
+helper_instance = None
+retired_helpers = set()
+sync_run = None
+table_ready = False
+update_sequences = {}
+pending_actions = {}
+pending_refresh = set()
 interaction_requests = {}
 next_interaction_id = 1
 client_sessions = {}
@@ -311,11 +324,7 @@ INTERACTION_MAX_CARD_COUNT = 10
 
 def drop_zone_visible_for_color(zone, color):
     allowed_colors = zone.get("allowed_colors")
-    if not allowed_colors:
-        return True
-    if not isinstance(allowed_colors, list):
-        return True
-    return color in allowed_colors
+    return allowed_colors is None or color in allowed_colors
 
 def drop_zones_for_color(color):
     return [
@@ -325,11 +334,7 @@ def drop_zones_for_color(color):
 
 def mobile_button_visible_for_color(button, color):
     allowed_colors = button.get("allowed_colors")
-    if not allowed_colors:
-        return True
-    if not isinstance(allowed_colors, list):
-        return True
-    return color in allowed_colors
+    return allowed_colors is None or color in allowed_colors
 
 def mobile_buttons_for_color(color):
     return [
@@ -337,37 +342,76 @@ def mobile_buttons_for_color(color):
         if isinstance(button, dict) and mobile_button_visible_for_color(button, color)
     ]
 
-def mark_lua_contact():
-    global last_lua_contact_at
-    first_contact = last_lua_contact_at is None
-    last_lua_contact_at = time.time()
-    return first_contact
-
 def lua_connection_status():
-    return {
-        "connected": last_lua_contact_at is not None,
-        "last_contact_at": last_lua_contact_at,
-    }
+    return {"connected": last_lua_contact_at is not None, "ready": table_ready}
+
+
+def emit_lua_status():
+    socketio.emit("lua_status", lua_connection_status())
+
+
+def begin_sync():
+    global sync_run, table_ready
+    sync_run = uuid.uuid4().hex
+    table_ready = False
+    update_sequences.clear()
+    for action_id in list(pending_actions):
+        finish_action(action_id, "uncertain")
+    interaction_requests.clear()
+    pending_refresh.clear()
+
+
+def expire_lua_contact(now):
+    global last_lua_contact_at
+    if last_lua_contact_at is not None and now - last_lua_contact_at >= LUA_TIMEOUT_SECONDS:
+        last_lua_contact_at = None
+        begin_sync()
+        emit_lua_status()
+        emit_hand_state_to_all_colors()
+
 
 def is_valid_tts_guid(value):
-    return isinstance(value, str) and re.match(r"^[0-9a-fA-F]{6}$", value) is not None
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{6}", value) is not None
+
+
+def lua_array(value):
+    # An empty Lua table can arrive as an empty JSON object.
+    if value == {}:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("expected an array")
+    return value
+
+
+def valid_color(color):
+    return isinstance(color, str) and color in (*TTS_COLORS, "Black")
+
 
 def valid_drop_zone(zone):
     if not isinstance(zone, dict):
         return False
-    if zone.get("type") == "global_snap":
-        return zone.get("snap_index") is not None
-    if zone.get("type") == "object_snap":
-        return is_valid_tts_guid(zone.get("object_guid")) and zone.get("snap_index") is not None
-    return False
+    kind = zone.get("type")
+    index = zone.get("snap_index")
+    position = zone.get("position")
+    return (
+        kind in ("global_snap", "object_snap")
+        and (kind != "object_snap" or is_valid_tts_guid(zone.get("object_guid")))
+        and type(index) is int and index > 0
+        and isinstance(zone.get("tag_key"), str) and bool(zone["tag_key"])
+        and isinstance(position, dict)
+        and all(type(position.get(axis)) in (int, float) and math.isfinite(position[axis]) for axis in ("x", "y", "z"))
+    )
+
 
 def sanitize_drop_zones(zones):
-    if not isinstance(zones, list):
-        return None
-    return [
-        zone for zone in zones
-        if valid_drop_zone(zone)
-    ]
+    zones = lua_array(zones)
+    for zone in zones:
+        if not valid_drop_zone(zone):
+            raise ValueError("invalid drop zone")
+        if zone.get("allowed_colors") is not None:
+            zone["allowed_colors"] = sanitize_color_list(zone["allowed_colors"])
+    return zones
+
 
 def valid_mobile_button(button):
     if not isinstance(button, dict):
@@ -375,31 +419,32 @@ def valid_mobile_button(button):
     click_function = button.get("click_function")
     owner_type = button.get("function_owner_type")
     return (
-        bool(button.get("id")) and
-        is_valid_tts_guid(button.get("object_guid")) and
-        bool(button.get("name")) and
-        isinstance(click_function, str) and
-        bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", click_function)) and
-        owner_type in {"global", "object"} and
-        (owner_type == "global" or is_valid_tts_guid(button.get("function_owner_guid")))
+        isinstance(button.get("id"), str) and bool(button["id"])
+        and is_valid_tts_guid(button.get("object_guid"))
+        and isinstance(button.get("name"), str) and bool(button["name"])
+        and isinstance(click_function, str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", click_function) is not None
+        and owner_type in ("global", "object")
+        and (owner_type == "global" or is_valid_tts_guid(button.get("function_owner_guid")))
     )
 
+
 def sanitize_mobile_buttons(buttons):
-    if not isinstance(buttons, list):
-        return None
-    return [
-        button for button in buttons
-        if valid_mobile_button(button)
-    ]
+    buttons = lua_array(buttons)
+    for button in buttons:
+        if not valid_mobile_button(button):
+            raise ValueError("invalid button")
+        if button.get("allowed_colors") is not None:
+            button["allowed_colors"] = sanitize_color_list(button["allowed_colors"])
+    return buttons
+
 
 def sanitize_color_list(colors):
-    if not isinstance(colors, list):
-        return None
-    result = []
-    for color in colors:
-        if isinstance(color, str) and color in game_state and color not in result:
-            result.append(color)
-    return result
+    colors = lua_array(colors)
+    if not all(valid_color(color) for color in colors):
+        raise ValueError("invalid player color")
+    return list(dict.fromkeys(colors))
+
 
 def occupied_colors():
     return [
@@ -457,7 +502,7 @@ def emit_hand_state_to_color(color, room=None, is_admin=False, client_id=None):
     socketio.emit(
         'hand_updated',
         {
-            'cards': game_state.get(color, []),
+            'cards': game_state.get(color, []) if table_ready else [],
             'players': known_player_colors(),
             'hand_zone_colors': known_hand_zone_colors(),
             'seated_colors': known_seated_colors(),
@@ -536,34 +581,43 @@ def print_start_qr_codes():
 
 
 def get_request_data(request):
-  data = {}
-  try:
-    # Da TTS laut Doku als application/x-www-form-urlencoded sendet, ist request.form hier randvoll mit unseren Daten! https://api.tabletopsimulator.com/webrequest/manager/#post
-    if request.form:
-      # 1. Wir holen uns die Liste aller Formular-Schluessel
-      form_keys = list(request.form.keys())
-      if form_keys:
-        raw_url_encoded_text = form_keys[0] # wir holen uns den String aus Position 0!
-        clean_json_text = unquote(raw_url_encoded_text) # 2. Dekodieren der Prozentzeichen
-        if clean_json_text.endswith('='): # Falls TTS am Ende ein '=' anhaengt, schneiden wir es ab
-          clean_json_text = clean_json_text[:-1]
-        # 3. Parsen des sauberen Text-Strings als echtes Dictionary
-        data = json.loads(clean_json_text)
-        if not isinstance(data, dict):
-          data = dict(data)
+    raw = request.get_data(cache=True, as_text=True)
+    if request.is_json or raw.lstrip().startswith("{"):
+        data = json.loads(raw)
     else:
-      print("[WARNUNG] get_request_data: Request enthielt keine Formulardaten.")
-  except Exception as e:
-      print(f"[CRITICAL] get_request_data: Fehler beim Formular-Parsing: {e}")
-  # if data:
-    # print("[DEBUG] get_request_data: data ist: ",data)
-  return data
-  
+        fields = list(request.form.items(multi=True))
+        if len(fields) != 1:
+            raise ValueError("expected a single JSON form field")
+        key, value = fields[0]
+        if key != "payload" and value:
+            raise ValueError("invalid JSON form field")
+        data = json.loads(value if key == "payload" else key)
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON object")
+    return data
+
+
+def lua_input():
+    try:
+        address = ip_address(request.remote_addr)
+        mapped = getattr(address, "ipv4_mapped", None)
+        if not (address.is_loopback or (mapped and mapped.is_loopback)):
+            raise ValueError
+    except ValueError:
+        return None, ({"status": "error", "message": "loopback required"}, 403)
+    try:
+        return get_request_data(request), None
+    except ValueError as exc:
+        return None, ({"status": "error", "message": str(exc)}, 400)
+
 
 def tts_cache_filename_from_url(url):
     if not isinstance(url, str) or not url:
         return None
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
     path = parsed.path or ""
     ext = Path(path).suffix
     if not ext:
@@ -578,7 +632,10 @@ def sanitize_browser_image_url(url):
     value = url.strip()
     if not value:
         return ""
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return ""
     if parsed.scheme in {"http", "https"}:
         return value
     if not parsed.scheme and not parsed.netloc and value.startswith("/local_image/"):
@@ -618,200 +675,238 @@ def local_image(filename):
     return "image not found", 404
 
 
-@app.route('/health', methods=['GET', 'POST'])
+@app.get("/health")
 def health():
-    if mark_lua_contact():
-        emit_hand_state_to_all_colors()
     return {"status": "ok"}
 
 
-  
-# 2. HTTP-Endpunkt fuer TTS (TTS schickt hier Karten-Updates hin , Optimiert mit Dubletten-Filter)
-@app.route('/update_hand', methods=['POST'])
-def update_hand():
-    first_lua_contact = mark_lua_contact()
-    data = get_request_data(request)
-    player_color = data.get("color")
-    cards = data.get("cards", [])
-    zones = data.get("drop_zones")
-    buttons = data.get("mobile_buttons")
-    colors = data.get("hand_zone_colors")
-    seats = data.get("seated_colors")
-    global drop_zones, mobile_buttons, hand_zone_colors, seated_colors
-    sanitized_zones = sanitize_drop_zones(zones)
-    if sanitized_zones is not None:
-        drop_zones = sanitized_zones
-    sanitized_buttons = sanitize_mobile_buttons(buttons)
-    if sanitized_buttons is not None:
-        mobile_buttons = sanitized_buttons
-    sanitized_colors = sanitize_color_list(colors)
-    colors_changed = sanitized_colors is not None and sanitized_colors != hand_zone_colors
-    if sanitized_colors is not None:
-        hand_zone_colors = sanitized_colors
-    sanitized_seats = sanitize_color_list(seats)
-    seats_changed = sanitized_seats is not None and sanitized_seats != seated_colors
-    if sanitized_seats is not None:
-        seated_colors = sanitized_seats
-    if not player_color:
-        return {"status": "error", "message": "missing color"}, 400
-    if not isinstance(cards, list):
-        return {"status": "error", "message": "cards must be a list"}, 400
-    # Falls TTS eine Farbe sendet, die Python noch nicht kennt:
-    if player_color not in game_state:
-        game_state[player_color] = []
-    # Lokale TTS-Cache-Bilder bevorzugen, Internet-URL als Fallback behalten
+@app.post("/health")
+def lua_health():
+    global helper_instance, last_lua_contact_at
+    data, error = lua_input()
+    if error:
+        return error
+    instance = data.get("helper")
+    if not isinstance(instance, str) or not re.fullmatch(r"[0-9a-fA-F]{6}:[0-9]+", instance):
+        return {"status": "error", "message": "invalid helper instance"}, 400
+
+    with STATE_LOCK:
+        now = time.monotonic()
+        expire_lua_contact(now)
+        if instance != helper_instance:
+            if instance in retired_helpers or (
+                last_lua_contact_at is not None
+                and helper_instance.split(":", 1)[0] != instance.split(":", 1)[0]
+            ):
+                return {"status": "error", "message": "another helper is active"}, 409
+            if helper_instance is not None:
+                retired_helpers.add(helper_instance)
+            helper_instance = instance
+            begin_sync()
+            last_lua_contact_at = None
+        first_contact = last_lua_contact_at is None
+        last_lua_contact_at = now
+        if first_contact:
+            emit_lua_status()
+            emit_hand_state_to_all_colors()
+        return {"status": "ok", "run": sync_run, "ready": table_ready}
+
+
+def read_cards(cards):
+    cards = lua_array(cards)
+    guids = set()
     for card in cards:
-        if not isinstance(card, dict):
-            continue
+        if not isinstance(card, dict) or not is_valid_tts_guid(card.get("guid")) or card["guid"] in guids:
+            raise ValueError("invalid or duplicate card")
+        guids.add(card["guid"])
+        if not isinstance(card.get("face_down", False), bool):
+            raise ValueError("invalid card orientation")
+        for field in ("name", "desc", "image", "back_image"):
+            if field in card and not isinstance(card[field], str):
+                raise ValueError(f"invalid card {field}")
         card["image"] = find_tts_cached_image_url(card.get("image"))
         card["back_image"] = find_tts_cached_image_url(card.get("back_image"))
         decals = card.get("attached_decals") or []
         if isinstance(decals, dict):
             decals = decals.values()
+        elif not isinstance(decals, list):
+            raise ValueError("invalid decals")
         for decal in decals:
             if not isinstance(decal, dict):
-                continue
-            custom_decal = decal.get("CustomDecal") or {}
-            image_url = custom_decal.get("ImageURL")
-            if image_url:
-                custom_decal["ImageURL"] = find_tts_cached_image_url(image_url)
-    old_state = json.dumps(game_state[player_color],sort_keys=True,ensure_ascii=False)
-    new_state = json.dumps(cards,sort_keys=True,ensure_ascii=False)
-    if old_state != new_state:
-        game_state[player_color] = cards
-        emit_hand_state_to_color(player_color)
-        print(f"[NETZWERK] Hand von Spieler {player_color} aktualisiert ({len(cards)} Karten).")
-    elif colors_changed or seats_changed or first_lua_contact:
+                raise ValueError("invalid decal")
+            custom = decal.get("CustomDecal") or {}
+            if not isinstance(custom, dict):
+                raise ValueError("invalid custom decal")
+            if custom.get("ImageURL"):
+                custom["ImageURL"] = find_tts_cached_image_url(custom["ImageURL"])
+    return cards
+
+
+def read_table_metadata(data):
+    return {
+        "drop_zones": sanitize_drop_zones(data["drop_zones"]),
+        "mobile_buttons": sanitize_mobile_buttons(data["mobile_buttons"]),
+        "hand_zone_colors": sanitize_color_list(data["hand_zone_colors"]),
+        "seated_colors": sanitize_color_list(data["seated_colors"]),
+    }
+
+
+def accept_update(data, stream, *, initial=False):
+    global last_lua_contact_at
+    sequence = data.get("sequence")
+    if type(sequence) is not int or sequence < 1:
+        return {"status": "error", "message": "invalid update sequence"}, 400
+    now = time.monotonic()
+    expire_lua_contact(now)
+    if (
+        last_lua_contact_at is None or data.get("run") != sync_run
+        or data.get("helper") != helper_instance or (not initial and not table_ready)
+    ):
+        return {"status": "error", "message": "resync required"}, 409
+    if sequence <= update_sequences.get(stream, 0):
+        return {"status": "ok", "stale": True}, 200
+    if initial and table_ready:
+        return {"status": "error", "message": "table already initialized"}, 409
+    update_sequences[stream] = sequence
+    last_lua_contact_at = now
+    return None
+
+
+def replace_table_metadata(metadata):
+    global drop_zones, mobile_buttons, hand_zone_colors, seated_colors
+    old = (drop_zones, mobile_buttons, hand_zone_colors, seated_colors)
+    drop_zones = metadata["drop_zones"]
+    mobile_buttons = metadata["mobile_buttons"]
+    hand_zone_colors = metadata["hand_zone_colors"]
+    seated_colors = metadata["seated_colors"]
+    return old != (drop_zones, mobile_buttons, hand_zone_colors, seated_colors)
+
+
+@app.post("/sync_snapshot")
+def sync_snapshot():
+    global table_ready
+    data, error = lua_input()
+    if error:
+        return error
+    try:
+        hands = data["hands"]
+        if not isinstance(hands, dict) or not all(valid_color(color) for color in hands):
+            raise ValueError("invalid hands")
+        metadata = read_table_metadata(data)
+        if not set(metadata["hand_zone_colors"]).issubset(hands):
+            raise ValueError("missing hands")
+        cards_by_color = {color: read_cards(cards) for color, cards in hands.items()}
+    except (KeyError, ValueError, OverflowError) as exc:
+        return {"status": "error", "message": str(exc)}, 400
+    with STATE_LOCK:
+        error = accept_update(data, "snapshot", initial=True)
+        if error:
+            return error
+        for color in dict.fromkeys([*TTS_COLORS, *game_state, *cards_by_color]):
+            game_state[color] = cards_by_color.get(color, [])
+        replace_table_metadata(metadata)
+        table_ready = True
         emit_hand_state_to_all_colors()
-    if first_lua_contact and old_state != new_state:
-        emit_hand_state_to_all_colors()
-
-    return {"status": "success"}
+        emit_lua_status()
+    return {"status": "ok"}
 
 
-@app.route('/update_drop_zones', methods=['POST'])
-def update_drop_zones():
-    mark_lua_contact()
-    data = get_request_data(request)
-    zones = data.get("drop_zones")
-    colors = data.get("hand_zone_colors")
-    seats = data.get("seated_colors")
-    sanitized_zones = sanitize_drop_zones(zones)
-    if sanitized_zones is None:
-        return {"status": "error", "message": "drop_zones must be a list"}, 400
-    global drop_zones, hand_zone_colors, seated_colors
-    old_state = json.dumps(drop_zones, sort_keys=True, ensure_ascii=False)
-    new_state = json.dumps(sanitized_zones, sort_keys=True, ensure_ascii=False)
-    if old_state != new_state:
-        drop_zones = sanitized_zones
-        print(f"[NETZWERK] Ablagezonen aktualisiert ({len(drop_zones)} Ziele).")
-    sanitized_colors = sanitize_color_list(colors)
-    if sanitized_colors is not None:
-        hand_zone_colors = sanitized_colors
-    sanitized_seats = sanitize_color_list(seats)
-    if sanitized_seats is not None:
-        seated_colors = sanitized_seats
-    emit_hand_state_to_all_colors()
-    return {"status": "success"}
+@app.post("/update_hand")
+def update_hand():
+    data, error = lua_input()
+    if error:
+        return error
+    try:
+        color = data["color"]
+        if not valid_color(color):
+            raise ValueError("invalid player color")
+        cards = read_cards(data["cards"])
+    except (KeyError, ValueError, OverflowError) as exc:
+        return {"status": "error", "message": str(exc)}, 400
+    with STATE_LOCK:
+        error = accept_update(data, ("hand", color))
+        if error:
+            return error
+        if color not in game_state or game_state[color] != cards or data.get("force") is True:
+            new_color = color not in game_state
+            game_state[color] = cards
+            if new_color:
+                emit_hand_state_to_all_colors()
+            else:
+                emit_hand_state_to_color(color)
+    return {"status": "ok"}
 
 
-@app.route('/update_mobile_buttons', methods=['POST'])
-def update_mobile_buttons():
-    mark_lua_contact()
-    data = get_request_data(request)
-    buttons = data.get("mobile_buttons")
-    colors = data.get("hand_zone_colors")
-    seats = data.get("seated_colors")
-    sanitized_buttons = sanitize_mobile_buttons(buttons)
-    if sanitized_buttons is None:
-        return {"status": "error", "message": "mobile_buttons must be a list"}, 400
-    global mobile_buttons, hand_zone_colors, seated_colors
-    old_state = json.dumps(mobile_buttons, sort_keys=True, ensure_ascii=False)
-    new_state = json.dumps(sanitized_buttons, sort_keys=True, ensure_ascii=False)
-    if old_state != new_state:
-        mobile_buttons = sanitized_buttons
-        print(f"[NETZWERK] Mobile-Buttons aktualisiert ({len(mobile_buttons)} Ziele).")
-    sanitized_colors = sanitize_color_list(colors)
-    if sanitized_colors is not None:
-        hand_zone_colors = sanitized_colors
-    sanitized_seats = sanitize_color_list(seats)
-    if sanitized_seats is not None:
-        seated_colors = sanitized_seats
-    emit_hand_state_to_all_colors()
-    return {"status": "success"}
+@app.post("/update_table")
+def update_table():
+    data, error = lua_input()
+    if error:
+        return error
+    try:
+        metadata = read_table_metadata(data)
+    except (KeyError, ValueError, OverflowError) as exc:
+        return {"status": "error", "message": str(exc)}, 400
+    with STATE_LOCK:
+        error = accept_update(data, "table")
+        if error:
+            return error
+        added_colors = [color for color in metadata["hand_zone_colors"] if color not in game_state]
+        for color in added_colors:
+            game_state[color] = []
+        if replace_table_metadata(metadata) or added_colors:
+            emit_hand_state_to_all_colors()
+    return {"status": "ok"}
 
 
-# 3. WebSockets: Handy verbindet sich und waehlt seine Farbe (Raum)
-@socketio.on('join')
+@socketio.on("join")
 def on_join(data):
-    color = data.get('color')
-    client_id = str(data.get('client_id') or '').strip()
-    is_admin = bool(data.get('is_admin'))
+    data = data if isinstance(data, dict) else {}
+    color = data.get("color")
+    client_id = str(data.get("client_id") or "").strip()
+    is_admin = data.get("is_admin") is True
     language = client_language_from_data(data)
     sid = request.sid
 
-    if color not in game_state:
-        emit('join_error', localized_payload('errors.invalid_player_color', language, field='error'))
-        return
-    if not client_id:
-        emit('join_error', localized_payload('errors.missing_client_id', language, field='error'))
-        return
-
-    previous_session = client_sessions.get(sid)
-    if previous_session and previous_session.get("color") != color:
-        leave_room(previous_session.get("color"))
-        previous_color = previous_session.get("color")
-        if (
-            not previous_session.get("is_admin") and
-            color_owners.get(previous_color) == previous_session.get("client_id")
-        ):
-            color_owners.pop(previous_color, None)
-
-    if not is_admin and color_is_occupied_by_other(color, client_id):
-        emit(
-            'join_error',
-            localized_payload('errors.color_occupied_by_other', language, {'color': color}, field='error')
-        )
-        return
-
-    if not is_admin:
-        color_owners[color] = client_id
-
-    client_sessions[sid] = {
-        "client_id": client_id,
-        "color": color,
-        "is_admin": is_admin,
-        "language": language,
-    }
-
-    join_room(color)
-    role = "Admin" if is_admin else "Spieler"
-    print(f"[VERBINDUNG] {role}-Smartphone fuer {color} angemeldet.")
-    emit_hand_state_to_color(color, room=sid, is_admin=is_admin, client_id=client_id)
-    emit_occupancy_to_all_clients()
-    get_tts_api_chatgpt().custom_message({
-        "action": "request_hand_sync",
-        "color": color,
-        "force": True,
-    })
-    return
+    with STATE_LOCK:
+        if not isinstance(color, str) or color not in game_state:
+            emit("join_error", localized_payload("errors.invalid_player_color", language, field="error"))
+            return
+        if not client_id:
+            emit("join_error", localized_payload("errors.missing_client_id", language, field="error"))
+            return
+        if not is_admin and color_is_occupied_by_other(color, client_id):
+            emit("join_error", localized_payload("errors.color_occupied_by_other", language, {"color": color}, field="error"))
+            return
+        previous = client_sessions.get(sid)
+        client_sessions[sid] = {"client_id": client_id, "color": color, "is_admin": is_admin, "language": language}
+        if previous and previous["color"] != color:
+            leave_room(previous["color"])
+        if previous:
+            release_color(previous)
+        if not is_admin:
+            color_owners[color] = client_id
+        join_room(color)
+        emit("join_success", {"color": color})
+        emit_occupancy_to_all_clients()
 
 
-@socketio.on('disconnect')
-def on_disconnect():
-    sid = request.sid
-    session = client_sessions.pop(sid, None)
-    if not session:
-        return
-    color = session.get("color")
-    client_id = session.get("client_id")
+def release_color(session):
+    color = session["color"]
+    client_id = session["client_id"]
     if (
-        not session.get("is_admin") and
-        color_owners.get(color) == client_id and
-        not color_client_has_live_session(color, client_id)
+        not session["is_admin"] and color_owners.get(color) == client_id
+        and not color_client_has_live_session(color, client_id)
     ):
         color_owners.pop(color, None)
-    emit_occupancy_to_all_clients()
+
+
+@socketio.on("disconnect")
+def on_disconnect():
+    with STATE_LOCK:
+        session = client_sessions.pop(request.sid, None)
+        if session:
+            release_color(session)
+            emit_occupancy_to_all_clients()
 
 
 def known_player_colors():
@@ -863,20 +958,13 @@ def interaction_selection_cards(request_data):
     ]
 
 
-def cleanup_expired_interactions():
-    now = time.time()
-    expired_ids = [
-        request_id for request_id, request_data in interaction_requests.items()
-        if now - request_data.get("created_at", now) > INTERACTION_TTL_SECONDS
-    ]
-    for request_id in expired_ids:
-        request_data = interaction_requests.pop(request_id, None)
-        if request_data:
-            emit_interaction_result(
-                request_data,
-                False,
-                "Die Anfrage ist abgelaufen.",
-            )
+def cleanup_expired_interactions(now=None):
+    now = time.monotonic() if now is None else now
+    for request_id, data in list(interaction_requests.items()):
+        if data["status"] != "processing" and now - data["created_at"] >= INTERACTION_TTL_SECONDS:
+            del interaction_requests[request_id]
+            emit_interaction_result(data, False, translate("errors.request_unavailable"), "errors.request_unavailable")
+            emit_interactions_for_request(data)
 
 
 def next_interaction_request_id():
@@ -898,7 +986,6 @@ def public_interaction_request(request_data):
 
 
 def interaction_summary_for_color(color):
-    cleanup_expired_interactions()
     incoming = []
     outgoing = []
     for request_data in interaction_requests.values():
@@ -939,7 +1026,7 @@ def emit_interaction_result(request_data, ok, message, message_key=None, message
 def clamp_interaction_count(value):
     try:
         count = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if count < 1:
         return None
@@ -947,10 +1034,12 @@ def clamp_interaction_count(value):
 
 
 def validate_interaction_target_message(from_color, target_color, count, language=None):
-    if from_color not in game_state:
+    if not isinstance(from_color, str) or from_color not in game_state:
         return localized_payload("errors.invalid_player_color", language)
-    if target_color not in known_player_colors():
+    if target_color not in hand_zone_colors:
         return localized_payload("errors.invalid_other_player", language)
+    if from_color not in hand_zone_colors:
+        return localized_payload("errors.invalid_player_color", language)
     if target_color == from_color:
         return localized_payload("errors.choose_other_player", language)
     if len(current_hand_guids(target_color)) < count:
@@ -958,35 +1047,125 @@ def validate_interaction_target_message(from_color, target_color, count, languag
     return None
 
 
-def send_card_action_to_tts(player_color, action_name, guids, target=None):
-    payload = {
-        "action": "card_action",
-        "color": player_color,
-        "card_action": action_name,
-        "guids_json": json.dumps(guids),
-        "target": target,
+def require_ready(event, language, field="error"):
+    expire_lua_contact(time.monotonic())
+    if table_ready:
+        return True
+    emit(event, localized_payload("errors.tts_not_ready", language, field=field, ok=False))
+    return False
+
+
+def register_action(sid, color, action, guids, target=None, interaction=None):
+    action_id = uuid.uuid4().hex
+    pending_actions[action_id] = {
+        "sid": sid, "color": color, "action": action, "target": target,
+        "interaction": interaction, "deadline": time.monotonic() + ACTION_TIMEOUT_SECONDS,
     }
-    get_tts_api_chatgpt().custom_message(payload)
+    return {
+        "action": "card_action", "action_id": action_id, "helper": helper_instance, "run": sync_run,
+        "color": color, "card_action": action, "guids_json": json.dumps(guids), "target": target,
+    }
 
 
-def request_tts_hand_sync(color, force=True):
-    if color not in game_state:
+def finish_action(action_id, status, error_key="errors.action_failed"):
+    action = pending_actions.pop(action_id, None)
+    if action is None:
         return
-    get_tts_api_chatgpt().custom_message({
-        "action": "request_hand_sync",
-        "color": color,
-        "force": force,
-    })
+    ok = status == "ok"
+    if status == "uncertain":
+        error_key = "errors.action_unconfirmed"
+    if not ok:
+        pending_refresh.add(action["color"])
+        if action["action"] == "give_to_player":
+            pending_refresh.add(action["target"])
+    interaction = action["interaction"]
+    if interaction is not None:
+        interaction_requests.pop(interaction["id"], None)
+        key = "interaction.cards_taken" if ok else error_key
+        emit_interaction_result(interaction, ok, translate(key), key)
+        emit_interactions_for_request(interaction)
+    else:
+        sid = action["sid"]
+        payload = {"ok": ok, "action": action["action"], "action_id": action_id, "color": action["color"]}
+        if not ok:
+            payload.update(localized_payload(error_key, client_language_from_sid(sid), field="error"))
+        socketio.emit("card_action_result", payload, to=sid)
 
 
-def request_tts_hand_sync_for_colors(colors, delays=(0.15, 0.8, 1.6)):
-    unique_colors = []
-    for color in colors:
-        if color in game_state and color not in unique_colors:
-            unique_colors.append(color)
-    for delay in delays:
-        for color in unique_colors:
-            threading.Timer(delay, request_tts_hand_sync, args=(color, True)).start()
+def dispatch_action(message):
+    try:
+        get_tts_api_chatgpt().custom_message(message)
+    except Exception as exc:
+        print(f"[TTS] Card action delivery failed: {exc}")
+        with STATE_LOCK:
+            finish_action(message["action_id"], "uncertain")
+
+
+@app.post("/action_result")
+def action_result():
+    data, error = lua_input()
+    if error:
+        return error
+    action_id, status = data.get("action_id"), data.get("result")
+    if not isinstance(action_id, str) or status not in ("ok", "rejected", "uncertain"):
+        return {"status": "error", "message": "invalid action result"}, 400
+    allowed_errors = (
+        "errors.action_failed", "errors.invalid_target_player", "errors.invalid_player_color", "errors.card_not_in_current_hand",
+        "errors.drop_target_changed", "errors.hand_order_changed",
+    )
+    error_key = data.get("error_key")
+    if error_key not in allowed_errors:
+        error_key = "errors.action_failed"
+    with STATE_LOCK:
+        if data.get("run") != sync_run or data.get("helper") != helper_instance:
+            return {"status": "error", "message": "resync required"}, 409
+        action = pending_actions.get(action_id)
+        if action and time.monotonic() >= action["deadline"]:
+            status = "uncertain"
+        finish_action(action_id, status, error_key)
+    return {"status": "ok"}
+
+
+def request_tts_hand_sync_for_colors(colors):
+    with STATE_LOCK:
+        if not table_ready:
+            return
+        run, helper = sync_run, helper_instance
+        colors = list(dict.fromkeys(color for color in colors if color in game_state))
+    try:
+        if colors:
+            get_tts_api_chatgpt().custom_message({
+                "action": "request_hand_sync", "helper": helper, "run": run,
+                "colors": colors, "force": True,
+            })
+    except Exception as exc:
+        print(f"[TTS] Hand sync request failed: {exc}")
+
+
+def maintenance_once():
+    with STATE_LOCK:
+        now = time.monotonic()
+        expire_lua_contact(now)
+        cleanup_expired_interactions(now)
+        for action_id, action in list(pending_actions.items()):
+            if now >= action["deadline"]:
+                finish_action(action_id, "uncertain")
+        colors = list(pending_refresh)
+        pending_refresh.clear()
+    if colors:
+        socketio.start_background_task(request_tts_hand_sync_for_colors, colors)
+
+
+def maintain_table():
+    while True:
+        maintenance_once()
+        socketio.sleep(0.5)
+
+
+class LuaHeartbeatLogFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        return not ('"POST /health HTTP/' in message and '" 200 ' in message)
 
 
 def lua_string(value):
@@ -1021,267 +1200,296 @@ return clickFunction(target, {lua_string(player_color)}, {alt_click_lua})
 
 
 # 4. Befehle vom Handy empfangen: Aktionen auf eine oder mehrere Karten
-@socketio.on('card_action')
+def matching_drop_zone(color, value):
+    if not isinstance(value, str):
+        return None
+    try:
+        target = json.loads(value)
+        if not valid_drop_zone(target):
+            return None
+    except (ValueError, OverflowError):
+        return None
+    identity = ("type", "object_guid", "snap_index", "tag_key", "position")
+    for zone in drop_zones_for_color(color):
+        if all(zone.get(key) == target.get(key) for key in identity):
+            return json.dumps({**zone, "spread_cards": target.get("spread_cards") is True})
+    return None
+
+
+@socketio.on("card_action")
 def on_card_action(data):
-    action_name = data.get('action')
-    player_color = data.get('color')
-    guids = sanitize_guid_list(data.get('guids'))
-    target = data.get('target')
-    language = client_language_from_sid(request.sid)
-
-    if player_color not in game_state:
-        emit('card_action_result', localized_payload('errors.invalid_player_color', language, field='error', ok=False))
-        return
-
-    if not socket_can_control_color(request.sid, player_color):
-        emit('card_action_result', localized_payload('errors.not_controlling_color', language, field='error', ok=False))
-        return
-
-    if not guids:
-        emit('card_action_result', localized_payload('errors.no_cards_selected', language, field='error', ok=False))
-        return
-
-    hand_guids = current_hand_guids(player_color)
-    if any(guid not in hand_guids for guid in guids):
-        emit('card_action_result', localized_payload('errors.card_not_in_current_hand', language, field='error', ok=False))
-        return
-
-    if action_name == 'give_to_player' and target not in known_player_colors():
-        emit('card_action_result', localized_payload('errors.invalid_target_player', language, field='error', ok=False))
-        return
-
-    print(f"[ACTION] {player_color}: {action_name} -> {guids}, target={target}")
-    send_card_action_to_tts(player_color, action_name, guids, target)
-
-    emit('card_action_result', {
-        'ok': True,
-        'action': action_name,
-        'guids': guids,
-    })
+    data = data if isinstance(data, dict) else {}
+    action_name, color = data.get("action"), data.get("color")
+    guids = sanitize_guid_list(data.get("guids"))
+    target = data.get("target")
+    sid = request.sid
+    with STATE_LOCK:
+        language = client_language_from_sid(sid)
+        if not require_ready("card_action_result", language):
+            return
+        error = None
+        if not isinstance(color, str) or color not in game_state:
+            error = "errors.invalid_player_color"
+        elif not socket_can_control_color(sid, color):
+            error = "errors.not_controlling_color"
+        elif action_name not in ("reorder_hand", "flip_cards", "play_to_table", "play_to_zone", "give_to_player"):
+            error = "errors.unknown_player_action"
+        elif not guids:
+            error = "errors.no_cards_selected"
+        elif not set(guids).issubset(current_hand_guids(color)):
+            error = "errors.card_not_in_current_hand"
+        elif action_name == "reorder_hand" and set(guids) != current_hand_guids(color):
+            error = "errors.hand_order_changed"
+        elif action_name == "give_to_player" and (target not in hand_zone_colors or target == color):
+            error = "errors.invalid_target_player"
+        elif action_name == "play_to_zone":
+            target = matching_drop_zone(color, target)
+            if target is None:
+                error = "errors.drop_target_changed"
+        if error:
+            emit("card_action_result", localized_payload(
+                error, language, field="error", ok=False, action=action_name, color=color,
+            ))
+            return
+        message = register_action(sid, color, action_name, guids, target)
+    dispatch_action(message)
 
 
 @socketio.on('interaction_request')
 def on_interaction_request(data):
-    from_color = data.get('color')
-    target_color = data.get('target_color')
-    interaction_type = data.get('interaction_type')
-    count = clamp_interaction_count(data.get('count'))
-    language = client_language_from_sid(request.sid)
+    data = data if isinstance(data, dict) else {}
+    with STATE_LOCK:
+        language = client_language_from_sid(request.sid)
+        if not require_ready("interaction_result", language, field="message"):
+            return
+        cleanup_expired_interactions()
+        from_color = data.get('color')
+        target_color = data.get('target_color')
+        interaction_type = data.get('interaction_type')
+        count = clamp_interaction_count(data.get('count'))
 
-    if interaction_type not in {'draw_random_hidden', 'pick_open'}:
-        emit('interaction_result', localized_payload('errors.unknown_player_action', language, ok=False))
-        return
-    if count is None:
-        emit('interaction_result', localized_payload('errors.invalid_card_count', language, ok=False))
-        return
+        if interaction_type not in ('draw_random_hidden', 'pick_open'):
+            emit('interaction_result', localized_payload('errors.unknown_player_action', language, ok=False))
+            return
+        if count is None:
+            emit('interaction_result', localized_payload('errors.invalid_card_count', language, ok=False))
+            return
 
-    error = validate_interaction_target_message(from_color, target_color, count, language)
-    if error:
-        error["ok"] = False
-        emit('interaction_result', error)
-        return
-    if not socket_can_control_color(request.sid, from_color):
-        emit('interaction_result', localized_payload('errors.not_controlling_color', language, ok=False))
-        return
+        error = validate_interaction_target_message(from_color, target_color, count, language)
+        if error:
+            error["ok"] = False
+            emit('interaction_result', error)
+            return
+        if not socket_can_control_color(request.sid, from_color):
+            emit('interaction_result', localized_payload('errors.not_controlling_color', language, ok=False))
+            return
 
-    request_data = {
-        "id": next_interaction_request_id(),
-        "type": interaction_type,
-        "from_color": from_color,
-        "target_color": target_color,
-        "count": count,
-        "status": "pending",
-        "created_at": time.time(),
-    }
-    interaction_requests[request_data["id"]] = request_data
-    emit_interactions_for_request(request_data)
-    emit('interaction_result', {
-        'ok': True,
-        'message': translate('interaction.request_sent', language),
-        'message_key': 'interaction.request_sent',
-        'message_params': {},
-        'request': public_interaction_request(request_data),
-    })
+        request_data = {
+            "id": next_interaction_request_id(),
+            "type": interaction_type,
+            "from_color": from_color,
+            "target_color": target_color,
+            "count": count,
+            "status": "pending",
+            "created_at": time.monotonic(),
+        }
+        interaction_requests[request_data["id"]] = request_data
+        emit_interactions_for_request(request_data)
+        emit('interaction_result', {
+            'ok': True,
+            'message': translate('interaction.request_sent', language),
+            'message_key': 'interaction.request_sent',
+            'message_params': {},
+            'request': public_interaction_request(request_data),
+        })
 
 
 @socketio.on('interaction_response')
 def on_interaction_response(data):
-    color = data.get('color')
-    request_id = str(data.get('request_id') or '')
-    accepted = bool(data.get('accepted'))
-    request_data = interaction_requests.get(request_id)
-    language = client_language_from_sid(request.sid)
+    data = data if isinstance(data, dict) else {}
+    with STATE_LOCK:
+        language = client_language_from_sid(request.sid)
+        if not require_ready("interaction_result", language, field="message"):
+            return
+        cleanup_expired_interactions()
+        request_data = interaction_requests.get(str(data.get('request_id') or ''))
+        color = data.get('color')
+        request_id = str(data.get('request_id') or '')
+        accepted = data.get('accepted') is True
 
-    if not request_data or request_data.get("status") != "pending":
-        emit('interaction_result', localized_payload('errors.request_unavailable', language, ok=False))
-        return
-    if request_data.get("target_color") != color:
-        emit('interaction_result', localized_payload('errors.request_not_for_you', language, ok=False))
-        return
-    if not socket_can_control_color(request.sid, color):
-        emit('interaction_result', localized_payload('errors.not_controlling_color', language, ok=False))
-        return
+        if not request_data or request_data.get("status") != "pending":
+            emit('interaction_result', localized_payload('errors.request_unavailable', language, ok=False))
+            return
+        if request_data.get("target_color") != color:
+            emit('interaction_result', localized_payload('errors.request_not_for_you', language, ok=False))
+            return
+        if not socket_can_control_color(request.sid, color):
+            emit('interaction_result', localized_payload('errors.not_controlling_color', language, ok=False))
+            return
 
-    if not accepted:
-        interaction_requests.pop(request_id, None)
-        emit_interaction_result(request_data, False, translate('interaction.request_denied', PC_LANGUAGE), 'interaction.request_denied')
-        emit_interactions_for_request(request_data)
-        return
+        if not accepted:
+            interaction_requests.pop(request_id, None)
+            emit_interaction_result(request_data, False, translate('interaction.request_denied', PC_LANGUAGE), 'interaction.request_denied')
+            emit_interactions_for_request(request_data)
+            return
 
-    error = validate_interaction_target_message(
-        request_data.get("from_color"),
-        request_data.get("target_color"),
-        request_data.get("count"),
-        language,
-    )
-    if error:
-        interaction_requests.pop(request_id, None)
-        emit_interaction_result(
-            request_data,
-            False,
-            error.get("message"),
-            error.get("message_key"),
-            error.get("message_params"),
+        error = validate_interaction_target_message(
+            request_data.get("from_color"),
+            request_data.get("target_color"),
+            request_data.get("count"),
+            language,
+        )
+        if error:
+            interaction_requests.pop(request_id, None)
+            emit_interaction_result(
+                request_data,
+                False,
+                error.get("message"),
+                error.get("message_key"),
+                error.get("message_params"),
+            )
+            emit_interactions_for_request(request_data)
+            return
+
+        request_data["status"] = "selecting"
+        request_data["approved_at"] = time.monotonic()
+        socketio.emit(
+            'interaction_open_pick',
+            {
+                'request': public_interaction_request(request_data),
+                'cards': interaction_selection_cards(request_data),
+            },
+            room=request_data.get("from_color"),
         )
         emit_interactions_for_request(request_data)
-        return
-
-    request_data["status"] = "selecting"
-    request_data["approved_at"] = time.time()
-    socketio.emit(
-        'interaction_open_pick',
-        {
-            'request': public_interaction_request(request_data),
-            'cards': interaction_selection_cards(request_data),
-        },
-        room=request_data.get("from_color"),
-    )
-    emit_interactions_for_request(request_data)
 
 
 @socketio.on('interaction_open_selection_request')
 def on_interaction_open_selection_request(data):
-    color = data.get('color')
-    request_id = str(data.get('request_id') or '')
-    request_data = interaction_requests.get(request_id)
-    language = client_language_from_sid(request.sid)
+    data = data if isinstance(data, dict) else {}
+    with STATE_LOCK:
+        language = client_language_from_sid(request.sid)
+        if not require_ready("interaction_result", language, field="message"):
+            return
+        cleanup_expired_interactions()
+        request_data = interaction_requests.get(str(data.get('request_id') or ''))
+        color = data.get('color')
+        request_id = str(data.get('request_id') or '')
 
-    if not request_data or request_data.get("status") != "selecting":
-        emit('interaction_result', localized_payload('errors.selection_unavailable', language, ok=False))
-        return
-    if request_data.get("from_color") != color:
-        emit('interaction_result', localized_payload('errors.selection_not_for_you', language, ok=False))
-        return
-    if not socket_can_control_color(request.sid, color):
-        emit('interaction_result', localized_payload('errors.not_controlling_color', language, ok=False))
-        return
+        if not request_data or request_data.get("status") != "selecting":
+            emit('interaction_result', localized_payload('errors.selection_unavailable', language, ok=False))
+            return
+        if request_data.get("from_color") != color:
+            emit('interaction_result', localized_payload('errors.selection_not_for_you', language, ok=False))
+            return
+        if not socket_can_control_color(request.sid, color):
+            emit('interaction_result', localized_payload('errors.not_controlling_color', language, ok=False))
+            return
 
-    emit('interaction_open_pick', {
-        'request': public_interaction_request(request_data),
-        'cards': interaction_selection_cards(request_data),
-    })
+        emit('interaction_open_pick', {
+            'request': public_interaction_request(request_data),
+            'cards': interaction_selection_cards(request_data),
+        })
 
 
-@socketio.on('interaction_pick_cards')
+@socketio.on("interaction_pick_cards")
 def on_interaction_pick_cards(data):
-    color = data.get('color')
-    request_id = str(data.get('request_id') or '')
-    guids = sanitize_guid_list(data.get('guids'))
-    request_data = interaction_requests.get(request_id)
-    language = client_language_from_sid(request.sid)
+    data = data if isinstance(data, dict) else {}
+    color = data.get("color")
+    request_id = str(data.get("request_id") or "")
+    guids = sanitize_guid_list(data.get("guids"))
+    sid = request.sid
+    with STATE_LOCK:
+        language = client_language_from_sid(sid)
+        if not require_ready("interaction_result", language, field="message"):
+            return
+        cleanup_expired_interactions()
+        interaction = interaction_requests.get(request_id)
+        error = None
+        if not interaction or interaction["status"] != "selecting":
+            error = "errors.selection_unavailable"
+        elif interaction["from_color"] != color:
+            error = "errors.selection_not_for_you"
+        elif not socket_can_control_color(sid, color):
+            error = "errors.not_controlling_color"
+        elif len(guids) != interaction["count"]:
+            error = "errors.pick_exact_count"
+        elif color not in hand_zone_colors:
+            error = "errors.invalid_target_player"
+        if error:
+            emit("interaction_result", localized_payload(error, language, ok=False))
+            return
 
-    if not request_data or request_data.get("status") != "selecting":
-        emit('interaction_result', localized_payload('errors.selection_unavailable', language, ok=False))
-        return
-    if request_data.get("from_color") != color:
-        emit('interaction_result', localized_payload('errors.selection_not_for_you', language, ok=False))
-        return
-    if not socket_can_control_color(request.sid, color):
-        emit('interaction_result', localized_payload('errors.not_controlling_color', language, ok=False))
-        return
-    if len(guids) != request_data.get("count"):
-        emit('interaction_result', localized_payload('errors.pick_exact_count', language, ok=False))
-        return
+        source = interaction["target_color"]
+        if not set(guids).issubset(current_hand_guids(source)):
+            interaction_requests.pop(request_id)
+            key = "errors.card_not_in_other_hand"
+            emit_interaction_result(interaction, False, translate(key, language), key)
+            emit_interactions_for_request(interaction)
+            return
 
-    target_hand_guids = current_hand_guids(request_data.get("target_color"))
-    if any(guid not in target_hand_guids for guid in guids):
-        interaction_requests.pop(request_id, None)
-        emit_interaction_result(
-            request_data,
-            False,
-            translate('errors.card_not_in_other_hand', PC_LANGUAGE),
-            'errors.card_not_in_other_hand',
-        )
-        emit_interactions_for_request(request_data)
-        return
-
-    send_card_action_to_tts(
-        request_data.get("target_color"),
-        "give_to_player",
-        guids,
-        request_data.get("from_color"),
-    )
-    request_tts_hand_sync_for_colors([
-        request_data.get("target_color"),
-        request_data.get("from_color"),
-    ])
-    interaction_requests.pop(request_id, None)
-    emit_interaction_result(
-        request_data,
-        True,
-        translate('interaction.cards_taken', PC_LANGUAGE),
-        'interaction.cards_taken',
-    )
-    emit_interactions_for_request(request_data)
+        interaction["status"] = "processing"
+        message = register_action(sid, source, "give_to_player", guids, color, interaction)
+        emit_interactions_for_request(interaction)
+    dispatch_action(message)
 
 
 @socketio.on('interaction_cancel')
 def on_interaction_cancel(data):
-    color = data.get('color')
-    request_id = str(data.get('request_id') or '')
-    request_data = interaction_requests.get(request_id)
-    language = client_language_from_sid(request.sid)
+    data = data if isinstance(data, dict) else {}
+    with STATE_LOCK:
+        language = client_language_from_sid(request.sid)
+        if not require_ready("interaction_result", language, field="message"):
+            return
+        cleanup_expired_interactions()
+        request_data = interaction_requests.get(str(data.get('request_id') or ''))
+        color = data.get('color')
+        request_id = str(data.get('request_id') or '')
 
-    if not request_data:
-        emit('interaction_result', localized_payload('errors.request_unavailable', language, ok=False))
-        return
-    if color not in {request_data.get("from_color"), request_data.get("target_color")}:
-        emit('interaction_result', localized_payload('errors.request_not_yours', language, ok=False))
-        return
-    if not socket_can_control_color(request.sid, color):
-        emit('interaction_result', localized_payload('errors.not_controlling_color', language, ok=False))
-        return
+        if not request_data or request_data["status"] == "processing":
+            emit('interaction_result', localized_payload('errors.request_unavailable', language, ok=False))
+            return
+        if color not in (request_data.get("from_color"), request_data.get("target_color")):
+            emit('interaction_result', localized_payload('errors.request_not_yours', language, ok=False))
+            return
+        if not socket_can_control_color(request.sid, color):
+            emit('interaction_result', localized_payload('errors.not_controlling_color', language, ok=False))
+            return
 
-    interaction_requests.pop(request_id, None)
-    emit_interaction_result(
-        request_data,
-        False,
-        translate('interaction.request_cancelled', PC_LANGUAGE),
-        'interaction.request_cancelled',
-    )
-    emit_interactions_for_request(request_data)
+        interaction_requests.pop(request_id, None)
+        emit_interaction_result(
+            request_data,
+            False,
+            translate('interaction.request_cancelled', PC_LANGUAGE),
+            'interaction.request_cancelled',
+        )
+        emit_interactions_for_request(request_data)
 
 
 @socketio.on('mobile_button_action')
 def on_mobile_button_action(data):
-    player_color = data.get('color')
-    button_id = data.get('button_id')
-    alt_click = bool(data.get('alt_click'))
-    language = client_language_from_sid(request.sid)
+    data = data if isinstance(data, dict) else {}
+    with STATE_LOCK:
+        player_color = data.get('color')
+        button_id = data.get('button_id')
+        alt_click = bool(data.get('alt_click'))
+        language = client_language_from_sid(request.sid)
+        if not require_ready('mobile_button_action_result', language):
+            return
 
-    if player_color not in game_state:
-        emit('mobile_button_action_result', localized_payload('errors.invalid_player_color', language, field='error', ok=False))
-        return
+        if not isinstance(player_color, str) or player_color not in game_state:
+            emit('mobile_button_action_result', localized_payload('errors.invalid_player_color', language, field='error', ok=False))
+            return
 
-    if not socket_can_control_color(request.sid, player_color):
-        emit('mobile_button_action_result', localized_payload('errors.not_controlling_color', language, field='error', ok=False))
-        return
+        if not socket_can_control_color(request.sid, player_color):
+            emit('mobile_button_action_result', localized_payload('errors.not_controlling_color', language, field='error', ok=False))
+            return
 
-    visible_buttons = mobile_buttons_for_color(player_color)
-    button = next((item for item in visible_buttons if item.get('id') == button_id), None)
-    if not button:
-        emit('mobile_button_action_result', localized_payload('errors.mobile_button_unavailable', language, field='error', ok=False))
-        return
+        visible_buttons = mobile_buttons_for_color(player_color)
+        button = next((item for item in visible_buttons if item.get('id') == button_id), None)
+        if not button:
+            emit('mobile_button_action_result', localized_payload('errors.mobile_button_unavailable', language, field='error', ok=False))
+            return
 
     print(f"[ACTION] {player_color}: mobile_button -> {button.get('name')} ({button_id}), alt_click={alt_click}")
     try:
@@ -1304,21 +1512,20 @@ def on_mobile_button_action(data):
     })
 
 
-@socketio.on('admin_sync_all_hands')
+@socketio.on("admin_sync_all_hands")
 def on_admin_sync_all_hands(data=None):
-    session = client_sessions.get(request.sid)
-    language = client_language_from_sid(request.sid)
-    if not session or not session.get("is_admin"):
-        emit('admin_sync_result', localized_payload('errors.admin_required', language, field='error', ok=False))
-        return
-
-    colors = known_hand_zone_colors() or known_player_colors()
-    request_tts_hand_sync_for_colors(colors)
-    emit('admin_sync_result', localized_payload(
-        'settings.sync_all_hands_sent',
-        language,
-        {'count': len(colors)},
-        ok=True,
+    with STATE_LOCK:
+        session = client_sessions.get(request.sid)
+        language = client_language_from_sid(request.sid)
+        if not session or not session.get("is_admin"):
+            emit("admin_sync_result", localized_payload("errors.admin_required", language, field="error", ok=False))
+            return
+        if not require_ready("admin_sync_result", language):
+            return
+        colors = known_player_colors()
+    socketio.start_background_task(request_tts_hand_sync_for_colors, colors)
+    emit("admin_sync_result", localized_payload(
+        "settings.sync_all_hands_sent", language, {"count": len(colors)}, ok=True,
     ))
 
 
@@ -1332,7 +1539,8 @@ def serve_socketio_js():
 def assign_player_color():
     language = request_language()
     client_id = request.args.get("client_id", "").strip()
-    color = active_color_for_client(client_id) or first_free_color(client_id)
+    with STATE_LOCK:
+        color = active_color_for_client(client_id) or first_free_color(client_id)
     if not client_id or not color:
         return render_error_page(translate("errors.all_colors_occupied", language), language)
     return redirect(f"/?color={color}")
@@ -1427,7 +1635,9 @@ if __name__ == '__main__':
             "[DEBUG] TTS External API Debug aktiv: "
             f"incoming={TTS_API_DEBUG_INCOMING}, outgoing={TTS_API_DEBUG_OUTGOING}"
         )
+    logging.getLogger('werkzeug').addFilter(LuaHeartbeatLogFilter())
     print_start_qr_codes()
+    socketio.start_background_task(maintain_table)
     # Startet den Server im lokalen Netzwerk
     # debug=False ist wichtig, da der Debug-Modus den Shutdown-Code oft doppelt ausfuehrt
     socketio.run(app, host='0.0.0.0', port=PORT, debug=False)

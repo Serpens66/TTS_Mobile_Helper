@@ -151,7 +151,7 @@ header {
 }
 
 .connection-status[data-state="connected"] .connection-dot { background: #4cd137; }
-.connection-status[data-state="lua-disconnected"] .connection-dot { background: #ffa502; }
+.connection-status:is([data-state="lua-disconnected"], [data-state="syncing"]) .connection-dot { background: #ffa502; }
 .connection-status[data-state="connecting"] .connection-dot { background: #ffa502; }
 .connection-status[data-state="disconnected"] .connection-dot { background: #ff4757; }
 

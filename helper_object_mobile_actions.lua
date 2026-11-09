@@ -13,21 +13,17 @@
 -- falls fuer ein Objekt keine Buttons im Handy angezeigt werden sollen, kann der Tag TTSmobileHideButtons verwendet werden
 
 local DEBUG = false
-local SERVER_URLS = {
-    health = "http://127.0.0.1:5001/health",
-    update_hand = "http://127.0.0.1:5001/update_hand",
-    update_drop_zones = "http://127.0.0.1:5001/update_drop_zones",
-    update_mobile_buttons = "http://127.0.0.1:5001/update_mobile_buttons"
-}
+local SERVER_URL = "http://127.0.0.1:5001"
 local TRACKED_COLORS = {}
-local last_sent_states = {}
-local known_card_flips = {}
-local last_sent_drop_zones_json = ""
-local pending_drop_zone_scan = false
-local last_sent_mobile_buttons_json = ""
-local pending_mobile_button_scan = false
-local python_server_connected = false
-local pending_python_server_check = false
+local helper_instance
+local sync_run
+local snapshot_ready = false
+local snapshot_pending = false
+local heartbeat_pending = false
+local pending_hand_scans = {}
+local pending_table_scan = false
+local streams = {}
+local seen_actions = {}
 
 function dlog(msg,...)
     if DEBUG then
@@ -104,104 +100,108 @@ function getHandObjectsForColor_TTSmobile(color)
     end)
 end
 
-function resetSentState_TTSmobile()
-    for _, color in ipairs(TRACKED_COLORS) do
-        last_sent_states[color] = ""
+local function postPayload(path, data, callback)
+    local finished = false
+    local timeout
+    local request = WebRequest.post(SERVER_URL .. path, {payload = JSON.encode(data)}, function(response)
+        if finished then
+            return
+        end
+        finished = true
+        if timeout then
+            Wait.stop(timeout)
+        end
+        local code = response and response.response_code or 0
+        callback(response ~= nil and not response.is_error and code >= 200 and code < 300, response, code)
+    end)
+    if not finished then
+        timeout = Wait.time(function()
+            finished = true
+            if request then
+                request.dispose()
+            end
+            callback(false, nil, 0)
+        end, 6)
     end
-    last_sent_drop_zones_json = ""
-    last_sent_mobile_buttons_json = ""
 end
 
-function onPythonServerConnected_TTSmobile(reason)
-    resetSentState_TTSmobile()
-    scheduleDropZoneScan_TTSmobile("Python Server verbunden: " .. tostring(reason), 0.1)
-    scheduleMobileButtonScan_TTSmobile("Python Server verbunden: " .. tostring(reason), 0.1)
-    scanAndSendAllHands_TTSmobile("Python Server verbunden: " .. tostring(reason))
+local function requirePythonServer_TTSmobile()
+    return snapshot_ready
 end
 
-function setPythonServerConnected_TTSmobile(connected, reason)
-    local wasConnected = python_server_connected
-    python_server_connected = connected == true
-    if python_server_connected and not wasConnected then
-        dlog("Python Server verbunden (" .. tostring(reason) .. ")")
-        onPythonServerConnected_TTSmobile(reason)
-    elseif not python_server_connected and wasConnected then
-        dlog("Python Server nicht erreichbar (" .. tostring(reason) .. ")")
-    end
-end
-
-function schedulePythonServerConnectionCheck_TTSmobile(reason, delay)
-    if pending_python_server_check then
+local function requestHeartbeat()
+    if heartbeat_pending then
         return
     end
-    pending_python_server_check = true
-    Wait.time(function()
-        pending_python_server_check = false
-        checkPythonServerConnection_TTSmobile(reason)
-    end, delay or 1.0)
-end
-
-function checkPythonServerConnection_TTSmobile(reason)
-    WebRequest.post(
-        SERVER_URLS["health"],
-        JSON.encode({
-            source = "tts_mobile"
-        }),
-        function(request)
-            if not request or request.is_error then
-                setPythonServerConnected_TTSmobile(false, (request and request.error) or reason)
-                schedulePythonServerConnectionCheck_TTSmobile("Reconnect nach Health-Fehler", 2.0)
-            else
-                setPythonServerConnected_TTSmobile(true, reason or "Health")
-            end
+    heartbeat_pending = true
+    postPayload("/health", {helper = helper_instance}, function(ok, response)
+        heartbeat_pending = false
+        if not ok then
+            snapshot_ready = false
+            return
         end
-    )
-end
-
-function requirePythonServer_TTSmobile(reason)
-    if python_server_connected then
-        return true
-    end
-    schedulePythonServerConnectionCheck_TTSmobile(reason, 0.5)
-    return false
-end
-
-function handlePythonServerRequestResult_TTSmobile(request, label)
-    if not request or request.is_error then
-        dlog(tostring(label) .. " fehlgeschlagen: " .. tostring(request and request.error or "keine Antwort"))
-        setPythonServerConnected_TTSmobile(false, label)
-        schedulePythonServerConnectionCheck_TTSmobile(label, 1.0)
-    else
-        setPythonServerConnected_TTSmobile(true, label)
-    end
+        local decoded, status = pcall(JSON.decode, response.text)
+        if not decoded or type(status) ~= "table" or type(status.run) ~= "string" then
+            snapshot_ready = false
+            return
+        end
+        if sync_run ~= status.run then
+            sync_run = status.run
+            snapshot_ready = false
+            snapshot_pending = false
+            streams = {}
+            seen_actions = {}
+        end
+        if status.ready then
+            local recovered = not snapshot_ready
+            snapshot_ready = true
+            if recovered then
+                scanAndSendAllHands_TTSmobile("Heartbeat")
+                scheduleTableScan_TTSmobile("Heartbeat", 0.1)
+            end
+            for stream, state in pairs(streams) do
+                if state.retry then
+                    state.retry = false
+                    if stream == "table" then
+                        scheduleTableScan_TTSmobile("Retry", 0.1)
+                    elseif stream ~= "snapshot" then
+                        scheduleHandScan_TTSmobile(stream, "Retry", 0.1, state.force)
+                    end
+                end
+            end
+        elseif not snapshot_ready then
+            syncSnapshot_TTSmobile()
+        end
+    end)
 end
 
 function onLoad(save_state)
-    dlog("onLoad Mobile Companion Helper aktiv")
-    TRACKED_COLORS = Player.getAvailableColors()
-    resetSentState_TTSmobile()
-    schedulePythonServerConnectionCheck_TTSmobile("onLoad", 0.2)
+    TRACKED_COLORS = {}
+    for _, color in ipairs(Player.getAvailableColors()) do
+        if color ~= "Grey" then
+            table.insert(TRACKED_COLORS, color)
+        end
+    end
+    helper_instance = self.getGUID() .. ":" .. string.format("%09d%09d", math.random(1, 999999999), math.random(1, 999999999))
+    Wait.time(requestHeartbeat, 0.2)
+    Wait.time(requestHeartbeat, 3, -1)
 end
 
-
-local pending_hand_scans = {}
-
-function scheduleHandScan_TTSmobile(color, reason, delay)
-    if not color then
+function scheduleHandScan_TTSmobile(color, reason, delay, force)
+    if not color or not snapshot_ready then
         return
     end
-    if not requirePythonServer_TTSmobile(reason or "Handscan") then
+    local pending = pending_hand_scans[color]
+    if pending then
+        pending.force = pending.force or force
         return
     end
-    delay = delay or 0.1
-    if pending_hand_scans[color] then
-        return
-    end
-    pending_hand_scans[color] = true
+    pending = {force = force}
+    pending_hand_scans[color] = pending
     Wait.time(function()
-        pending_hand_scans[color] = false
-        scanAndSendHand_TTSmobile(color, reason .. " delayed")
-    end, delay)
+        pending_hand_scans[color] = nil
+        scanAndSendHand_TTSmobile(color, reason, pending.force)
+    end, delay or 0.1)
 end
 
 function getColorForCardInHand_TTSmobile(card)
@@ -239,8 +239,7 @@ function onObjectDrop(player_color, object)
     if not requirePythonServer_TTSmobile("onObjectDrop") then
         return
     end
-    scheduleDropZoneScan_TTSmobile("Objekt gedroppt", 0.5)
-    scheduleMobileButtonScan_TTSmobile("Objekt gedroppt", 0.5)
+    scheduleTableScan_TTSmobile("Objekt gedroppt", 0.5)
     if object and safeObjectTag_TTSmobile(object) == "Card" then
         Wait.time(function()
             local handColor = getColorForCardInHand_TTSmobile(object)
@@ -259,24 +258,21 @@ function onObjectSpawn(object)
     if not requirePythonServer_TTSmobile("onObjectSpawn") then
         return
     end
-    scheduleDropZoneScan_TTSmobile("Objekt gespawnt", 0.5)
-    scheduleMobileButtonScan_TTSmobile("Objekt gespawnt", 0.5)
+    scheduleTableScan_TTSmobile("Objekt gespawnt", 0.5)
 end
 
 function onObjectDestroy(object)
     if not requirePythonServer_TTSmobile("onObjectDestroy") then
         return
     end
-    scheduleDropZoneScan_TTSmobile("Objekt geloescht", 0.5)
-    scheduleMobileButtonScan_TTSmobile("Objekt geloescht", 0.5)
+    scheduleTableScan_TTSmobile("Objekt geloescht", 0.5)
 end
 
 function onObjectStateChange(object, old_guid)
     if not requirePythonServer_TTSmobile("onObjectStateChange") then
         return
     end
-    scheduleDropZoneScan_TTSmobile("Objektzustand geaendert", 0.5)
-    scheduleMobileButtonScan_TTSmobile("Objektzustand geaendert", 0.5)
+    scheduleTableScan_TTSmobile("Objektzustand geaendert", 0.5)
 end
 
 function onObjectEnterZone(zone, object)
@@ -285,10 +281,6 @@ function onObjectEnterZone(zone, object)
     end
     dlog("onObjectEnterZone")
     if zone and safeObjectTag_TTSmobile(zone) == "Hand" and object and safeObjectTag_TTSmobile(object) == "Card" then
-        local objectGuid = safeObjectCall_TTSmobile(object, "getGUID", nil)
-        if objectGuid then
-            known_card_flips[objectGuid] = nil
-        end
         Wait.time(function()
             local handColor = getColorForCardInHand_TTSmobile(object)
             if handColor then
@@ -337,64 +329,27 @@ function onExternalMessage(data)
 end
 
 function handleExternalMessage_TTSmobile(data)
-    dlog("onExternalMessage")
-    setPythonServerConnected_TTSmobile(true, "onExternalMessage")
-    if not data or not data.action then
-        return
-    end
-    if data.action == "play_card" then
-        playCardFromMobile(data.color, data.guid)
+    if not snapshot_ready or type(data) ~= "table" or data.helper ~= helper_instance or data.run ~= sync_run then
         return
     end
     if data.action == "card_action" then
-        local guids = {}
-        if data.guids_json then
-            local ok, decoded = pcall(function()
-                return JSON.decode(data.guids_json)
-            end)
-            if ok and decoded then
-                guids = decoded
+        local ok, guids = pcall(JSON.decode, data.guids_json or "")
+        handleCardAction_TTSmobile(data, ok and guids or nil)
+    elseif data.action == "request_hand_sync" and type(data.colors) == "table" then
+        for _, color in ipairs(data.colors) do
+            if isValidPlayerColor_TTSmobile(color) then
+                scheduleHandScan_TTSmobile(color, "request_hand_sync", 0.1, data.force == true)
             end
-        elseif data.guid then
-            guids = { data.guid }
         end
-        handleCardAction_TTSmobile(
-            data.color,
-            data.card_action,
-            guids,
-            data.target
-        )
-        return
-    end
-    if data.action == "request_hand_sync" then
-        requestHandSync_TTSmobile(data.color, data.force)
-        return
+        scheduleTableScan_TTSmobile("request_hand_sync", 0.1, data.force == true)
     end
 end
-
-
-
-function requestHandSync_TTSmobile(color, force)
-    if not color then
-        return
-    end
-    if not requirePythonServer_TTSmobile("request_hand_sync") then
-        return
-    end
-    if force then
-        last_sent_states[color] = ""
-    end
-    scheduleDropZoneScan_TTSmobile("request_hand_sync", 0.1)
-    scheduleMobileButtonScan_TTSmobile("request_hand_sync", 0.1)
-    scanAndSendHand_TTSmobile(color, "request_hand_sync")
-end
-
 
 function getActualFaceDown_TTSmobile(card)
     if not card then
         return false
     end
-    if card.is_face_down ~= nil then
+    if type(card.is_face_down) == "boolean" then
         return card.is_face_down
     end
     local rot = safeObjectCall_TTSmobile(card, "getRotation", nil)
@@ -405,18 +360,6 @@ function getActualFaceDown_TTSmobile(card)
     end
     rotZ = math.abs(rotZ or 0) % 360
     return rotZ > 90 and rotZ < 270
-end
-
-function getKnownFaceDown_TTSmobile(card)
-    if not card then
-        return false
-    end
-    local cardGuid = safeObjectCall_TTSmobile(card, "getGUID", nil)
-    local knownFlip = cardGuid and known_card_flips[cardGuid] or nil
-    if knownFlip ~= nil then
-        return knownFlip
-    end
-    return getActualFaceDown_TTSmobile(card)
 end
 
 function getYawFromRotation_TTSmobile(rotation, fallbackYaw)
@@ -458,46 +401,27 @@ function getRotationWithYaw_TTSmobile(card, yaw)
 end
 
 function onObjectRotate(object, spin, flip, player_color, old_spin, old_flip)
-    if not requirePythonServer_TTSmobile("onObjectRotate") then
-        return
-    end
-    dlog("onObjectRotate flip: "..tostring(flip)..","..tostring(old_flip))
-    if object and safeObjectTag_TTSmobile(object) == "Card" then
-        local objectGuid = safeObjectCall_TTSmobile(object, "getGUID", nil)
-        if objectGuid then
-            known_card_flips[objectGuid] = flip
-        end
-        scanAndSendAllHands_TTSmobile("Karte rotiert")
+    if snapshot_ready and flip ~= old_flip and object and safeObjectTag_TTSmobile(object) == "Card" then
+        local color = getColorForCardInHand_TTSmobile(object)
+        scheduleHandScan_TTSmobile(color, "card rotation", 0.25)
     end
 end
 
-function playCardFromMobile(color, guid)
-    handleCardAction_TTSmobile(color, "play_to_table", { guid }, nil)
-end
-
-function flipCardsFromMobile_TTSmobile(color, cards, guids)
-    cards = cards or getCardsFromGuids_TTSmobile(guids)
+function flipCardsFromMobile_TTSmobile(color, cards)
     for _, card in ipairs(cards) do
-        local guid = safeObjectCall_TTSmobile(card, "getGUID", nil)
-        if guid then
-            known_card_flips[guid] = not getKnownFaceDown_TTSmobile(card)
-        end
         card.flip()
     end
-    scheduleHandScan_TTSmobile(color, "Karten umgedreht", 0.1)
+    return true
 end
 
-function getCardsFromGuids_TTSmobile(guids)
+local function liveHandCards(color)
     local cards = {}
-    if type(guids) ~= "table" then
-        return cards
-    end
-    for _, guid in ipairs(guids) do
-        local card = getObjectFromGUID(guid)
-        if card and safeObjectTag_TTSmobile(card) == "Card" then
-            table.insert(cards, card)
-        else
-            dlog("Karte nicht gefunden oder keine Karte: " .. tostring(guid))
+    for _, card in ipairs(getHandObjectsForColor_TTSmobile(color)) do
+        if safeObjectTag_TTSmobile(card) == "Card" then
+            local guid = safeObjectCall_TTSmobile(card, "getGUID", nil)
+            if guid then
+                cards[guid] = card
+            end
         end
     end
     return cards
@@ -517,23 +441,126 @@ function getActionHandlers_TTSmobile()
     return ACTION_HANDLERS
 end
 
-function handleCardAction_TTSmobile(color, actionName, guids, target)
-    if not color or not actionName then
+local function sendActionResult(data, result, error_key)
+    postPayload("/action_result", {
+        helper = helper_instance, run = data.run, action_id = data.action_id,
+        result = result, error_key = error_key,
+    }, function(ok)
+        if not ok then
+            dlog("Could not deliver action result " .. tostring(data.action_id))
+        end
+    end)
+end
+
+local function actionApplied(data, guids, expectedFlips)
+    local source = liveHandCards(data.color)
+    if data.card_action == "reorder_hand" then
+        local zone = getHandZoneForColor(data.color)
+        if not zone then
+            return false
+        end
+        local ordered = {}
+        for guid, card in pairs(source) do
+            table.insert(ordered, {guid = guid, position = getHandSortValue(card, zone)})
+        end
+        table.sort(ordered, function(a, b) return a.position < b.position end)
+        if #ordered ~= #guids then
+            return false
+        end
+        for i, guid in ipairs(guids) do
+            if ordered[i].guid ~= guid then
+                return false
+            end
+        end
+        return true
+    end
+
+    local destination = data.card_action == "give_to_player" and liveHandCards(data.target) or nil
+    for _, guid in ipairs(guids) do
+        if expectedFlips then
+            if not source[guid] or getActualFaceDown_TTSmobile(source[guid]) ~= expectedFlips[guid] then
+                return false
+            end
+        elseif source[guid] or (destination and not destination[guid]) then
+            return false
+        end
+    end
+    return true
+end
+
+function handleCardAction_TTSmobile(data, guids)
+    if type(data.action_id) ~= "string" or seen_actions[data.action_id] then
         return
     end
-    local handler = getActionHandlers_TTSmobile()[actionName]
-    if handler then
-        local cards = getCardsFromGuids_TTSmobile(guids)
-        handler(color, cards, guids, target)
+    local runActions = seen_actions
+    runActions[data.action_id] = true
+    Wait.time(function() runActions[data.action_id] = nil end, 30)
+
+    local handler = getActionHandlers_TTSmobile()[data.card_action]
+    if not handler or not isValidPlayerColor_TTSmobile(data.color) or type(guids) ~= "table" or #guids == 0 then
+        sendActionResult(data, "rejected", "errors.action_failed")
+        return
+    end
+    local liveCards = liveHandCards(data.color)
+    local cards, used = {}, {}
+    local expectedFlips = data.card_action == "flip_cards" and {} or nil
+    for _, guid in ipairs(guids) do
+        local card = liveCards[guid]
+        if not card or used[guid] then
+            sendActionResult(data, "rejected", "errors.card_not_in_current_hand")
+            return
+        end
+        used[guid] = true
+        table.insert(cards, card)
+        if expectedFlips then
+            expectedFlips[guid] = not getActualFaceDown_TTSmobile(card)
+        end
+    end
+    if data.card_action == "reorder_hand" then
+        for guid in pairs(liveCards) do
+            if not used[guid] then
+                sendActionResult(data, "rejected", "errors.hand_order_changed")
+                return
+            end
+        end
+    end
+
+    local function complete(result, error_key)
+        if sync_run ~= data.run then
+            return
+        end
+        if result ~= "rejected" then
+            scheduleHandScan_TTSmobile(data.color, "card action", 0.1, result == "uncertain")
+            if data.card_action == "give_to_player" then
+                scheduleHandScan_TTSmobile(data.target, "card action", 0.1, result == "uncertain")
+            end
+            scheduleTableScan_TTSmobile("card action", 0.5)
+        end
+        sendActionResult(data, result, error_key)
+    end
+
+    local called, accepted, error_key = pcall(handler, data.color, cards, guids, data.target)
+    if not called then
+        log("Mobile Helper action failed: " .. tostring(accepted))
+        complete("uncertain")
+    elseif not accepted then
+        complete("rejected", error_key)
     else
-        dlog("Unbekannte card_action: " .. tostring(actionName))
+        Wait.condition(
+            function() complete("ok") end,
+            function() return actionApplied(data, guids, expectedFlips) end,
+            4,
+            function() complete("uncertain") end
+        )
     end
 end
 
-
 function playCardsToTable_TTSmobile(color, cards)
+    if not getHandTransformForColor_TTSmobile(color) then
+        return false, "errors.invalid_player_color"
+    end
     placeCardsInFrontOfHandZone_TTSmobile(color, cards)
-    scheduleHandScan_TTSmobile(color, "Karten ausgespielt", 0.1)
+    return true
 end
 
 function placeCardsInFrontOfHandZone_TTSmobile(color, cards)
@@ -602,93 +629,67 @@ function placeCardsInFrontOfHandZone_TTSmobile(color, cards)
     end
 end
 
-function playCardsToDropZone_TTSmobile(color, cards,guids, targetJson)
-    if not color or not cards or #cards == 0 then
-        return
-    end
-    local target = nil
-    if targetJson then
-        local ok, decoded = pcall(function()
-            return JSON.decode(targetJson)
-        end)
-        if ok and decoded then
-            target = decoded
-        end
-    end
-    if not target then
-        dlog("Drop-Ziel konnte nicht gelesen werden, spiele vor der Handzone: " .. tostring(targetJson))
-        playCardsToTable_TTSmobile(color, cards)
-        return
-    end
-    if target.type == "global_snap" then
-        local snapPoints = Global.getSnapPoints() or {}
-        local snap = snapPoints[target.snap_index]
-
-        if not snap then
-            dlog("Global Snap Point nicht gefunden: " .. tostring(target.snap_index))
-            playCardsToTable_TTSmobile(color, cards)
-            return
-        end
-
-        local pos = snap.position
-        local yaw = getYawFromRotation_TTSmobile(snap.rotation, 180)
-        local spreadCards = target.spread_cards == true
-        dlog("Spiele Karten auf Global Snap-Ziel " .. tostring(target.name))
-
-        placeCardsOnDropTarget_TTSmobile(cards, pos, yaw, spreadCards)
-
-        scheduleHandScan_TTSmobile(color, "Karten auf Global Snap-Ziel gespielt", 0.3)
-        return
-    elseif target.type == "object_snap" then
-        local obj = getObjectFromGUID(target.object_guid)
-        if not obj then
-            dlog("Snap-Zielobjekt nicht gefunden: " .. tostring(target.object_guid))
-            playCardsToTable_TTSmobile(color, cards)
-            return
-        end
-        local snapPoints = obj.getSnapPoints()
-        local snap = snapPoints[target.snap_index]
-        if not snap then
-            dlog("Snap Point nicht gefunden: " .. tostring(target.snap_index))
-            playCardsToTable_TTSmobile(color, cards)
-            return
-        end
-        local pos = obj.positionToWorld(snap.position)
-        local objYaw = getYawFromRotation_TTSmobile(obj.getRotation(), 0)
-        local snapYaw = getYawFromRotation_TTSmobile(snap.rotation, 0)
-        local yaw = objYaw + snapYaw
-        local spreadCards = target.spread_cards == true
-        dlog(
-            "Spiele Karten auf Snap-Ziel " ..
-            tostring(target.name) ..
-            " bei x=" .. tostring(pos.x) ..
-            ", y=" .. tostring(pos.y) ..
-                ", z=" .. tostring(pos.z)
-        )
-        placeCardsOnDropTarget_TTSmobile(cards, pos, yaw, spreadCards)
-        scheduleHandScan_TTSmobile(color, "Karten auf Snap-Ziel gespielt", 0.3)
-        return
-    end
-    dlog("Unbekannter Drop-Zieltyp: " .. tostring(target.type))
-    playCardsToTable_TTSmobile(color, cards)
+local function sameSnapPosition(a, b)
+    return a and b
+        and math.abs(a.x - b.x) < 0.001
+        and math.abs(a.y - b.y) < 0.001
+        and math.abs(a.z - b.z) < 0.001
 end
 
-function giveCardsToPlayer_TTSmobile(sourceColor, cards,guids, targetColor)
-    if not sourceColor or not cards or #cards == 0 then
-        return
+local function snapHasTarget(snap, target, color)
+    if not snap or not sameSnapPosition(snap.position, target.position) then
+        return false
     end
-    if not targetColor or not safeGetPlayer_TTSmobile(targetColor) then
-        dlog("Zielspieler ungueltig: " .. tostring(targetColor))
-        return
+    for _, tagged in ipairs(getMobileDropTargetsFromSnapTags_TTSmobile(snap.tags)) do
+        if tagged.key == target.tag_key then
+            if tagged.allowed_colors == nil then
+                return true
+            end
+            for _, allowed in ipairs(tagged.allowed_colors) do
+                if allowed == color then
+                    return true
+                end
+            end
+        end
     end
+    return false
+end
+
+function playCardsToDropZone_TTSmobile(color, cards, guids, targetJson)
+    local ok, target = pcall(JSON.decode, targetJson or "")
+    if not ok or type(target) ~= "table" then
+        return false, "errors.drop_target_changed"
+    end
+
+    local obj, snap
+    if target.type == "global_snap" then
+        snap = (Global.getSnapPoints() or {})[target.snap_index]
+    elseif target.type == "object_snap" then
+        obj = getObjectFromGUID(target.object_guid)
+        if obj then
+            snap = (obj.getSnapPoints() or {})[target.snap_index]
+        end
+    end
+    if not snapHasTarget(snap, target, color) then
+        return false, "errors.drop_target_changed"
+    end
+
+    local pos = obj and obj.positionToWorld(snap.position) or snap.position
+    local yaw = getYawFromRotation_TTSmobile(snap.rotation, obj and 0 or 180)
+    if obj then
+        yaw = yaw + getYawFromRotation_TTSmobile(obj.getRotation(), 0)
+    end
+    placeCardsOnDropTarget_TTSmobile(cards, pos, yaw, target.spread_cards == true)
+    return true
+end
+
+function giveCardsToPlayer_TTSmobile(sourceColor, cards, guids, targetColor)
     local handTransform = getHandTransformForColor_TTSmobile(targetColor)
     if not handTransform then
-        dlog("Kein HandTransform fuer Zielspieler: " .. tostring(targetColor))
-        return
+        return false, "errors.invalid_target_player"
     end
     placeCardsInHandTransform_TTSmobile(cards, handTransform, 0)
-    scheduleHandScan_TTSmobile(sourceColor, "Karten weitergegeben Quelle", 0.1)
-    scheduleHandScan_TTSmobile(targetColor, "Karten weitergegeben Ziel", 0.1)
+    return true
 end
 
 function reorderHandFromMobile_TTSmobile(color, cards, orderedGuids)
@@ -748,7 +749,7 @@ function reorderHandFromMobile_TTSmobile(color, cards, orderedGuids)
             pos.z
         }, false, false)
     end
-    scheduleHandScan_TTSmobile(color, "Hand sortiert", 0.1)
+    return true
 end
 
 function placeCardsAtWorldPosition_TTSmobile(cards, center, spacing, yaw)
@@ -908,13 +909,10 @@ function placeCardsInHandTransform_TTSmobile(cards, handTransform, yOffset)
 end
 
 
-function scanAndSendHand_TTSmobile(color, ausloeser)
-    if not requirePythonServer_TTSmobile(ausloeser or "scanAndSendHand") then
-        return
-    end
+function collectHand_TTSmobile(color)
     local handZone = getHandZoneForColor(color)
     if not handZone then
-        return
+        return {}
     end
     local cardsData = {}
     local handObjects = getHandObjectsForColor_TTSmobile(color)
@@ -940,13 +938,6 @@ function scanAndSendHand_TTSmobile(color, ausloeser)
             if not guid then
                 return nil
             end
-            local flip = known_card_flips[guid]
-            local faceDown = false
-            if flip ~= nil then
-                faceDown = flip
-            else -- Fallback nur fuer Karten, die bereits verdeckt aufgenommen wurden
-                faceDown = getActualFaceDown_TTSmobile(obj)
-            end
             local objectName = safeObjectCall_TTSmobile(obj, "getName", "")
             local objectDescription = safeObjectCall_TTSmobile(obj, "getDescription", "")
 
@@ -960,7 +951,7 @@ function scanAndSendHand_TTSmobile(color, ausloeser)
                 card_index = cardIndex,
                 atlas_width = customDeck and customDeck.NumWidth or 1,
                 atlas_height = customDeck and customDeck.NumHeight or 1,
-                face_down = faceDown,
+                face_down = getActualFaceDown_TTSmobile(obj),
                 hide_when_face_down = data and data.HideWhenFaceDown or false,
                 back_is_hidden = customDeck and customDeck.BackIsHidden or false,
                 scale_x = data and data.Transform and data.Transform.scaleX or 1,
@@ -999,11 +990,7 @@ function scanAndSendHand_TTSmobile(color, ausloeser)
         -- return a.hand_sort > b.hand_sort
     end)
     
-    local currentJson = JSON.encode(cardsData)
-    if currentJson ~= last_sent_states[color] then
-        last_sent_states[color] = currentJson
-        sendHandToPython_TTSmobile(color, cardsData)
-    end
+    return cardsData
 end
 
 function getHandZoneForColor(color)
@@ -1215,6 +1202,8 @@ function scanDropZones_TTSmobile()
             insertDropTargetIfNew_TTSmobile(targets, seenDropZoneKeys, target.key, "", {
                 type = "global_snap",
                 snap_index = snapIndex,
+                tag_key = target.key,
+                position = {x = snap.position.x, y = snap.position.y, z = snap.position.z},
                 name = target.name,
                 allowed_colors = target.allowed_colors,
             })
@@ -1380,133 +1369,123 @@ function scanMobileButtons_TTSmobile()
     return mobileButtons
 end
 
-function scheduleDropZoneScan_TTSmobile(reason, delay)
-    if not requirePythonServer_TTSmobile(reason or "Drop-Zonen-Scan") then
+function scheduleTableScan_TTSmobile(reason, delay, force)
+    if not snapshot_ready then
         return
     end
-    delay = delay or 0.5
-    if pending_drop_zone_scan then
+    if pending_table_scan then
+        pending_table_scan.force = pending_table_scan.force or force
         return
     end
-    pending_drop_zone_scan = true
+    local pending = {force = force}
+    pending_table_scan = pending
     Wait.time(function()
-        pending_drop_zone_scan = false
-        scanAndSendDropZonesIfChanged_TTSmobile(reason .. " delayed")
-    end, delay)
+        pending_table_scan = false
+        if snapshot_ready then
+            sendTableMetadata_TTSmobile(pending.force)
+        end
+    end, delay or 0.5)
 end
 
-function scheduleMobileButtonScan_TTSmobile(reason, delay)
-    if not requirePythonServer_TTSmobile(reason or "Mobile-Button-Scan") then
-        return
-    end
-    delay = delay or 0.5
-    if pending_mobile_button_scan then
-        return
-    end
-    pending_mobile_button_scan = true
-    Wait.time(function()
-        pending_mobile_button_scan = false
-        scanAndSendMobileButtonsIfChanged_TTSmobile(reason .. " delayed")
-    end, delay)
+function onPlayerChangeColor()
+    scheduleTableScan_TTSmobile("seat change")
 end
 
-function scanAndSendDropZonesIfChanged_TTSmobile(reason)
-    if not requirePythonServer_TTSmobile(reason or "Drop-Zonen-Scan") then
+function onPlayerConnect()
+    scheduleTableScan_TTSmobile("player joined")
+end
+
+function onPlayerDisconnect()
+    scheduleTableScan_TTSmobile("player left")
+end
+
+local function collectTableMetadata()
+    return {
+        drop_zones = scanDropZones_TTSmobile(),
+        mobile_buttons = scanMobileButtons_TTSmobile(),
+        hand_zone_colors = getHandZoneColors_TTSmobile(),
+        seated_colors = getSeatedColors_TTSmobile(),
+    }
+end
+
+local function sendUpdate(path, stream, data, fingerprint, force, callback)
+    local state = streams[stream] or {sequence = 0}
+    streams[stream] = state
+    if not force and (state.in_flight == fingerprint or (state.in_flight == nil and state.sent == fingerprint)) then
         return
     end
-    local ok, dropZonesOrError = pcall(function()
-        return scanDropZones_TTSmobile()
+    state.sequence = state.sequence + 1
+    state.in_flight = fingerprint
+    local sequence, run = state.sequence, sync_run
+    data.helper, data.run, data.sequence = helper_instance, run, sequence
+    postPayload(path, data, function(ok, _, code)
+        if sync_run ~= run or state.sequence ~= sequence then
+            return
+        end
+        state.in_flight = nil
+        if ok then
+            state.sent = fingerprint
+            state.retry = false
+        elseif code == 409 then
+            snapshot_ready = false
+        elseif code == 0 or code >= 500 then
+            state.retry, state.force = true, force
+        else
+            log("Mobile Helper update rejected: " .. path .. " (" .. tostring(code) .. ")")
+        end
+        if callback then
+            callback(ok)
+        end
     end)
+end
+
+function sendTableMetadata_TTSmobile(force)
+    local ok, data = pcall(collectTableMetadata)
+    if ok then
+        sendUpdate("/update_table", "table", data, JSON.encode(data), force)
+    else
+        log("Mobile Helper table scan failed: " .. tostring(data))
+    end
+end
+
+function syncSnapshot_TTSmobile()
+    if snapshot_pending then
+        return
+    end
+    local ok, snapshot = pcall(collectTableMetadata)
     if not ok then
-        log("Mobile Companion Drop-Zonen-Scan fehlgeschlagen: " .. tostring(dropZonesOrError))
+        log("Mobile Helper snapshot failed: " .. tostring(snapshot))
         return
     end
-    local dropZones = dropZonesOrError
-    local currentJson = JSON.encode(dropZones)
-    if currentJson == last_sent_drop_zones_json then
-        return
+    local metadata = JSON.encode(snapshot)
+    snapshot.hands = {}
+    local handFingerprints = {}
+    for _, color in ipairs(TRACKED_COLORS) do
+        local cards = collectHand_TTSmobile(color)
+        snapshot.hands[color] = cards
+        handFingerprints[color] = JSON.encode(cards)
     end
-    last_sent_drop_zones_json = currentJson
-    sendDropZonesToPython_TTSmobile(dropZones)
-end
-
-function scanAndSendMobileButtonsIfChanged_TTSmobile(reason)
-    if not requirePythonServer_TTSmobile(reason or "Mobile-Button-Scan") then
-        return
-    end
-    local ok, mobileButtonsOrError = pcall(function()
-        return scanMobileButtons_TTSmobile()
-    end)
-    if not ok then
-        log("Mobile Companion Button-Scan fehlgeschlagen: " .. tostring(mobileButtonsOrError))
-        return
-    end
-    local mobileButtons = mobileButtonsOrError
-    local currentJson = JSON.encode(mobileButtons)
-    if currentJson == last_sent_mobile_buttons_json then
-        return
-    end
-    last_sent_mobile_buttons_json = currentJson
-    sendMobileButtonsToPython_TTSmobile(mobileButtons)
-end
-
-function sendDropZonesToPython_TTSmobile(dropZones)
-    if not requirePythonServer_TTSmobile("Drop-Zonen senden") then
-        return
-    end
-    WebRequest.post(
-        SERVER_URLS["update_drop_zones"],
-        JSON.encode({
-            drop_zones = dropZones,
-            hand_zone_colors = getHandZoneColors_TTSmobile(),
-            seated_colors = getSeatedColors_TTSmobile()
-        }),
-        function(request)
-            handlePythonServerRequestResult_TTSmobile(request, "Senden der Drop-Zonen an Python")
+    snapshot_pending = true
+    sendUpdate("/sync_snapshot", "snapshot", snapshot, "", true, function(success)
+        snapshot_pending = false
+        if success and not snapshot_ready then
+            snapshot_ready = true
+            streams.table = {sequence = 0, sent = metadata}
+            for color, fingerprint in pairs(handFingerprints) do
+                streams[color] = {sequence = 0, sent = fingerprint}
+            end
+            -- Re-read changes that took place while the snapshot was in flight.
+            scanAndSendAllHands_TTSmobile("snapshot complete")
+            scheduleTableScan_TTSmobile("snapshot complete", 0.1)
         end
-    )
+    end)
 end
 
-function sendMobileButtonsToPython_TTSmobile(mobileButtons)
-    if not requirePythonServer_TTSmobile("Mobile-Buttons senden") then
+function scanAndSendHand_TTSmobile(color, reason, force)
+    if not snapshot_ready then
         return
     end
-    WebRequest.post(
-        SERVER_URLS["update_mobile_buttons"],
-        JSON.encode({
-            mobile_buttons = mobileButtons,
-            hand_zone_colors = getHandZoneColors_TTSmobile(),
-            seated_colors = getSeatedColors_TTSmobile()
-        }),
-        function(request)
-            handlePythonServerRequestResult_TTSmobile(request, "Senden der Mobile-Buttons an Python")
-        end
-    )
-end
-
-
-function sendHandToPython_TTSmobile(playerColor, cardsList)
-    if not requirePythonServer_TTSmobile("Handdaten senden") then
-        return
-    end
-    local dropZones = safeCall_TTSmobile("scanDropZones fuer Hand-Sync", {}, function()
-        return scanDropZones_TTSmobile()
-    end)
-    local mobileButtons = safeCall_TTSmobile("scanMobileButtons fuer Hand-Sync", {}, function()
-        return scanMobileButtons_TTSmobile()
-    end)
-    WebRequest.post(
-        SERVER_URLS["update_hand"],
-        JSON.encode({
-            color = playerColor,
-            cards = cardsList,
-            drop_zones = dropZones,
-            mobile_buttons = mobileButtons,
-            hand_zone_colors = getHandZoneColors_TTSmobile(),
-            seated_colors = getSeatedColors_TTSmobile()
-        }),
-        function(request)
-            handlePythonServerRequestResult_TTSmobile(request, "Senden der Handdaten an Python")
-        end
-    )
+    local cards = collectHand_TTSmobile(color)
+    sendUpdate("/update_hand", color, {color = color, cards = cards, force = force == true}, JSON.encode(cards), force)
+    scheduleTableScan_TTSmobile(reason, 0.5)
 end

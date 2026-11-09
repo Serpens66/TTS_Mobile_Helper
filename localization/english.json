@@ -149,6 +149,11 @@
   "settings.sync_all_hands_sent": "Sync requested for {count} color(s).",
   "status.lua_disconnected": "Python connected, waiting for TTS/Lua",
   "status.info_connected": "The phone is connected to Python, and Python has received data from the TTS Lua script.",
-  "status.info_lua_disconnected": "The phone is connected to Python, but Python has not received any contact from the TTS Lua script since the server started. Load the helper object in TTS or check the Lua server connection.",
-  "status.info_disconnected": "The phone is not connected to the Python server."
+  "status.info_lua_disconnected": "The phone can reach Python, but the TTS helper is not responding. Check that the helper object is loaded on the current table.",
+  "status.info_disconnected": "The phone is not connected to the Python server.",
+  "errors.tts_not_ready": "The TTS table is not ready. Wait for synchronization.",
+  "errors.action_unconfirmed": "TTS did not confirm the action. Check the current hand before trying again.",
+  "errors.drop_target_changed": "This drop target is no longer available. Choose a current target.",
+  "errors.hand_order_changed": "The hand changed before sorting. The current order has been restored.",
+  "status.syncing": "Synchronizing the TTS table"
 }
