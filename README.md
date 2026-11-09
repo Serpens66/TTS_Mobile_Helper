@@ -21,6 +21,21 @@ and https://github.com/LucasOe/tts-external-api/tree/master (converted by Codex 
 - Scan the QR code shown in the python console with your mobile phone (admin or player. admins are able to control each player, while players are only able to control one colour)
 - Your mobile phones should now show the Interface and you should be connected.
 
+## Build on Windows
+
+Install the Python dependencies and run the build from the repository directory.
+
+```powershell
+python -m pip install Flask Flask-SocketIO python-engineio qrcode PyInstaller
+.\build_pyinstaller.bat
+```
+
+The executable and its companion files are written to `dist/TTSMobileHelper/`. Distribute the whole folder when packaging a Windows release. To use a portable Python installation, install the same dependencies with that interpreter and pass its executable to the build script.
+
+```powershell
+.\build_pyinstaller.bat -Python "C:/path/to/python.exe"
+```
+
 # Customization in TTS:
 ## To define Card Drop zones to be displayed on mobile: 
 - Create "Snap Point" in TTS and rightclick it.
