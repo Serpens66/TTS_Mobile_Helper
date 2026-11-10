@@ -98,6 +98,34 @@ class MobileHelperTest(unittest.TestCase):
         remote = self.http.post("/health", json={"helper": self.helper}, environ_overrides={"REMOTE_ADDR": "192.168.1.55"})
         self.assertEqual(remote.status_code, 403)
 
+    def test_legacy_helper_warns_once_without_establishing_contact(self):
+        with patch("builtins.print") as console:
+            for path, data in (
+                ("/health", {"source": "tts_mobile"}),
+                ("/update_hand", {"color": "Red", "cards": []}),
+                ("/update_drop_zones", {"drop_zones": []}),
+                ("/update_mobile_buttons", {"mobile_buttons": []}),
+            ):
+                response = self.http.post(path, data={"payload": json.dumps(data)})
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.json["code"], "protocol_mismatch")
+                self.assertIn("Workshop", response.json["message"])
+            console.assert_called_once()
+        self.assertEqual(self.server.lua_connection_status(), {"connected": False, "ready": False})
+
+    def test_heartbeat_reports_protocol_and_identifies_an_older_server(self):
+        with patch("builtins.print") as console:
+            response = self.http.post("/health", json={"helper": self.helper, "protocol": 2})
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.json["protocol"], 1)
+            self.assertIn("Windows server is older", response.json["message"])
+            console.assert_called_once()
+        self.assertFalse(self.server.lua_connection_status()["connected"])
+        self.assertEqual(self.handshake()["protocol"], 1)
+        response = self.http.post("/health", json={"helper": self.helper, "protocol": 1})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["run"], self.run)
+
     def test_form_round_trip_and_atomic_validation(self):
         self.handshake()
         self.assertEqual(self.snapshot().status_code, 200)

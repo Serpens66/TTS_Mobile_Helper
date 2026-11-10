@@ -304,11 +304,13 @@ mobile_buttons = []
 hand_zone_colors = []
 seated_colors = []
 STATE_LOCK = threading.RLock()
+LUA_PROTOCOL = 1
 LUA_TIMEOUT_SECONDS = 10
 ACTION_TIMEOUT_SECONDS = 10
 last_lua_contact_at = None
 helper_instance = None
 retired_helpers = set()
+protocol_warnings = set()
 sync_run = None
 table_ready = False
 update_sequences = {}
@@ -680,6 +682,27 @@ def health():
     return {"status": "ok"}
 
 
+def protocol_mismatch(received):
+    older_helper = received < LUA_PROTOCOL
+    direction = "lua_helper" if older_helper else "windows_server"
+    if older_helper:
+        message = (
+            "The TTS helper object is outdated. Replace it with the updated Workshop object "
+            "or paste the matching helper_object_mobile_actions.lua into the existing object. "
+            "https://steamcommunity.com/sharedfiles/filedetails/?id=3739147243"
+        )
+    else:
+        message = (
+            "The Windows server is older than the TTS helper. Update it to the matching GitHub release. "
+            "https://github.com/Serpens66/TTS_Mobile_Helper/releases"
+        )
+    with STATE_LOCK:
+        if direction not in protocol_warnings:
+            print(f"[Mobile Helper] {message}", flush=True)
+            protocol_warnings.add(direction)
+    return {"status": "error", "code": "protocol_mismatch", "protocol": LUA_PROTOCOL, "message": message}, 409
+
+
 @app.post("/health")
 def lua_health():
     global helper_instance, last_lua_contact_at
@@ -687,8 +710,16 @@ def lua_health():
     if error:
         return error
     instance = data.get("helper")
+    if instance is None and "protocol" not in data and data.get("source") == "tts_mobile":
+        return protocol_mismatch(0)
     if not isinstance(instance, str) or not re.fullmatch(r"[0-9a-fA-F]{6}:[0-9]+", instance):
         return {"status": "error", "message": "invalid helper instance"}, 400
+    # The first snapshot-capable helper used this protocol without a version field.
+    protocol = data.get("protocol", LUA_PROTOCOL)
+    if type(protocol) is not int or protocol < 1:
+        return {"status": "error", "message": "invalid helper protocol"}, 400
+    if protocol != LUA_PROTOCOL:
+        return protocol_mismatch(protocol)
 
     with STATE_LOCK:
         now = time.monotonic()
@@ -709,7 +740,7 @@ def lua_health():
         if first_contact:
             emit_lua_status()
             emit_hand_state_to_all_colors()
-        return {"status": "ok", "run": sync_run, "ready": table_ready}
+        return {"status": "ok", "protocol": LUA_PROTOCOL, "run": sync_run, "ready": table_ready}
 
 
 def read_cards(cards):
@@ -816,6 +847,11 @@ def update_hand():
     data, error = lua_input()
     if error:
         return error
+    if (
+        not {"helper", "run", "protocol"}.intersection(data)
+        and valid_color(data.get("color")) and isinstance(data.get("cards"), (list, dict))
+    ):
+        return protocol_mismatch(0)
     try:
         color = data["color"]
         if not valid_color(color):
@@ -835,6 +871,18 @@ def update_hand():
             else:
                 emit_hand_state_to_color(color)
     return {"status": "ok"}
+
+
+@app.post("/update_drop_zones")
+@app.post("/update_mobile_buttons")
+def legacy_table_update():
+    data, error = lua_input()
+    if error:
+        return error
+    field = "drop_zones" if request.path == "/update_drop_zones" else "mobile_buttons"
+    if isinstance(data.get(field), (list, dict)):
+        return protocol_mismatch(0)
+    return {"status": "error", "message": "invalid legacy update"}, 400
 
 
 @app.post("/update_table")

@@ -34,6 +34,7 @@ python server_mobile_actions.py
 | If you see | Try |
 | --- | --- |
 | The phone cannot open the QR link | Check that the phone and PC are on the same network. Open `http://<PC-IP>:5001/` from the phone. If the QR code shows the wrong address, start the current source with `python server_mobile_actions.py --lan-ip 192.168.1.100`, using the PC's IPv4 address on that network. The option also works in Windows builds made from this source. |
+| The server or TTS chat reports a version mismatch | Use the Windows server and Lua helper from the same release. If the object is outdated, remove the old object and additively load the updated Workshop helper, or replace the Lua script in the existing object and use **Save & Play**. Save the game to keep the updated object. |
 | The page opens but waits for TTS | Check that the Lua helper is loaded on the active table and the server is running on the TTS PC. |
 | You need logs to diagnose TTS communication | Start with `--debug-tts-api` for both directions, or use `--debug-tts-incoming` or `--debug-tts-outgoing`. To enable logging in TTS, set `local DEBUG = true` in the helper object's Lua script. |
 

@@ -14,12 +14,14 @@
 
 local DEBUG = false
 local SERVER_URL = "http://127.0.0.1:5001"
+local LUA_PROTOCOL = 1
 local TRACKED_COLORS = {}
 local helper_instance
 local sync_run
 local snapshot_ready = false
 local snapshot_pending = false
 local heartbeat_pending = false
+local protocol_warning
 local pending_hand_scans = {}
 local pending_table_scan = false
 local streams = {}
@@ -129,22 +131,48 @@ local function requirePythonServer_TTSmobile()
     return snapshot_ready
 end
 
+local function warnProtocolMismatch(component)
+    if protocol_warning == component then
+        return
+    end
+    protocol_warning = component
+    local message
+    if component == "windows_server" then
+        message = "Update the Windows server from GitHub Releases. Use the release that matches this Lua helper."
+    else
+        message = "Update the TTS helper object from the Steam Workshop or load the Lua script that matches the Windows server."
+    end
+    broadcastToAll("[Mobile Helper] " .. message, {1, 0.75, 0.25})
+end
+
 local function requestHeartbeat()
     if heartbeat_pending then
         return
     end
     heartbeat_pending = true
-    postPayload("/health", {helper = helper_instance}, function(ok, response)
+    postPayload("/health", {helper = helper_instance, protocol = LUA_PROTOCOL}, function(ok, response)
         heartbeat_pending = false
-        if not ok then
+        local decoded, status = pcall(JSON.decode, response and response.text or "")
+        if not decoded or type(status) ~= "table" then
             snapshot_ready = false
             return
         end
-        local decoded, status = pcall(JSON.decode, response.text)
-        if not decoded or type(status) ~= "table" or type(status.run) ~= "string" then
+        if (ok or status.code == "protocol_mismatch")
+            and type(status.protocol) == "number" and status.protocol ~= LUA_PROTOCOL then
+            snapshot_ready = false
+            warnProtocolMismatch(status.protocol < LUA_PROTOCOL and "windows_server" or "lua_helper")
+            return
+        end
+        if ok and status.status == "ok" and status.protocol == nil and status.run == nil then
+            snapshot_ready = false
+            warnProtocolMismatch("windows_server")
+            return
+        end
+        if not ok or type(status.run) ~= "string" or type(status.ready) ~= "boolean" then
             snapshot_ready = false
             return
         end
+        protocol_warning = nil
         if sync_run ~= status.run then
             sync_run = status.run
             snapshot_ready = false
